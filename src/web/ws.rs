@@ -5,7 +5,6 @@ use axum::{
 
 use super::AppState;
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::stream::StreamExt;
 use tokio::time::{Duration, interval};
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -13,15 +12,13 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    let mut last_sent = 0usize;
-
     let initial_logs = state.get_logs();
     for log in &initial_logs {
         if socket.send(Message::Text(log.clone())).await.is_err() {
             return;
         }
     }
-    last_sent = initial_logs.len();
+    let mut last_sent = initial_logs.len();
 
     let mut ticket = interval(Duration::from_millis(500));
 

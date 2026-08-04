@@ -14,7 +14,7 @@ impl MapTransformer {
 }
 
 impl Transformer for MapTransformer {
-    fn transform(&self, mut rows: Vec<Row>) -> Result<Vec<Row>, EtlError> {
+    fn transform(&self, rows: Vec<Row>) -> Result<Vec<Row>, EtlError> {
         let result = rows.into_iter()
             .map(|row| {
                 row.into_iter()
@@ -30,6 +30,7 @@ impl Transformer for MapTransformer {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Value, make_row};

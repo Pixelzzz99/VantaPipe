@@ -13,7 +13,6 @@ pub struct ClickHouseExtractor {
     query_template: String,
     username: String,
     password: String,
-    chunk_size: usize,
 }
 
 impl ClickHouseExtractor {
@@ -23,7 +22,6 @@ impl ClickHouseExtractor {
         query_template: String,
         username: String,
         password: String,
-        chunk_size: usize,
     ) -> Result<Self, EtlError> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -39,7 +37,6 @@ impl ClickHouseExtractor {
             query_template,
             username,
             password,
-            chunk_size,
         })
     }
 
@@ -148,7 +145,6 @@ mod tests {
             "SELECT * FROM orders WHERE updated_at > '{last_run}'".to_string(),
             "default".to_string(),
             "".to_string(),
-            10_000,
         )
         .unwrap()
     }

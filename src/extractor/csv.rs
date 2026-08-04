@@ -11,7 +11,6 @@ pub struct CsvExtractor {
     watch_dir: PathBuf,
     processed_dir: PathBuf,
     delimiter: u8,
-    chunk_size: usize,
     state: Arc<Mutex<PersistentState>>,
     state_path: String,
 }
@@ -21,7 +20,6 @@ impl CsvExtractor {
         watch_dir: &str,
         processed_dir: &str,
         delimiter: char,
-        chunk_size: usize,
         state: Arc<Mutex<PersistentState>>,
         state_path: String,
     ) -> Result<Self, EtlError> {
@@ -34,7 +32,6 @@ impl CsvExtractor {
             watch_dir: PathBuf::from(watch_dir),
             processed_dir: PathBuf::from(processed_dir),
             delimiter: delimiter as u8,
-            chunk_size,
             state,
             state_path,
         })
@@ -218,7 +215,6 @@ mod tests {
             "/tmp",
             "/tmp/processed_test",
             ',',
-            100,
             state,
             "/tmp/etl_state_csv_test.json".to_string(),
         )

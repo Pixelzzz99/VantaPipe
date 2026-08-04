@@ -1,309 +1,200 @@
+mod auth;
 mod config;
 mod error;
 mod extractor;
+mod history;
 mod loader;
 mod pipeline;
+mod registry;
 mod retry;
+mod runtime;
+mod scheduler;
 mod state;
 mod transformer;
 mod types;
+mod watcher;
 mod web;
 
-use std::sync::{Arc, Mutex};
-use tokio::time::{Duration, sleep};
+use std::path::{Path, PathBuf};
 
-use config::{PipelineConfig, SourceConfig, TransformConfig, load_config};
-use extractor::Extractor;
-use extractor::clickhouse::ClickHouseExtractor;
-use extractor::csv::CsvExtractor;
-use extractor::postgres::PostgresExtractor;
-use loader::postgres::PostgresLoader;
-use pipeline::{Pipeline, PipelineState};
-use retry::retry_with_backoff;
-use state::PersistentState;
-use transformer::{
-    Transformer, aggregator::AggregateTransformer, filter::FilterTransformer,
-    mapper::MapTransformer,
+use config::{
+    LoadedPipeline, load_config, load_configs_from_dir, resolve_pipeline_id, validate_depends_on,
 };
-use web::{AppState, PipelineStatus, start_server};
-
-// ---------------------------------------------------------------------------
-// Entry point — high-level flow only
-// ---------------------------------------------------------------------------
+use history::{RunHistoryStore, history_dir_from_state_arg};
+use registry::{PipelineRegistry, register_and_spawn_pipeline};
+use watcher::{ReloadDebounce, spawn_config_watcher};
+use web::{AppState, start_server};
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    // 1. CLI args: <config> <state> <port>
     let args = parse_args();
-    log::info!("Loading config from: {}", args.config_path);
-    log::info!("Loading state from {}", args.state_path);
+    log::info!("Config: {}", args.config_path);
+    log::info!("State: {}", args.state_display());
     log::info!("Web UI: http://localhost:{}", args.web_port);
 
-    // 2. Config + persisted state
-    let config = load_config(&args.config_path).unwrap_or_else(|e| {
-        log::error!("Failed to load config: {}", e);
+    let auth_config = auth::BasicAuthConfig::from_env().unwrap_or_else(|e| {
+        log::error!("Invalid auth configuration: {}", e);
+        std::process::exit(1);
+    });
+    match &auth_config {
+        Some(cfg) => log::info!("API authentication enabled for user '{}'", cfg.username),
+        None => log::warn!(
+            "API authentication is disabled — set ETL_AUTH_USER and ETL_AUTH_PASS \
+             to protect the dashboard/API before exposing this port beyond localhost."
+        ),
+    }
+
+    let loaded = load_pipelines(&args).unwrap_or_else(|e| {
+        log::error!("Failed to load config(s): {}", e);
         std::process::exit(1);
     });
 
-    let app_state = AppState::new(args.config_path.clone());
-    let persistent_state = Arc::new(Mutex::new(PersistentState::load(&args.state_path)));
-    restore_app_stats(&app_state, &persistent_state);
+    let history_dir = history_dir_from_state_arg(&args.state_arg, args.legacy_state_file);
+    let history = RunHistoryStore::new(history_dir);
+    let reload_debounce: ReloadDebounce = Default::default();
 
-    // 3. Build ETL pipeline (extract → transform → load)
-    let (poll_interval, extractor) =
-        build_extractor(&config, &persistent_state, &args.state_path).await;
-    let transformers = build_transformers(&config);
-    let loader = build_loader(&config).await;
-    let pipeline = Pipeline::new(extractor, transformers, Box::new(loader));
-    let pipeline_state = pipeline_state_from(&persistent_state);
+    // Directory mode (and not the legacy single-state-file variant of it)
+    // is the only case where it's meaningful to register brand-new
+    // pipelines at runtime — a single fixed config file has nowhere to add
+    // new pipelines to.
+    let registry = if Path::new(&args.config_path).is_dir() && !args.legacy_state_file {
+        Some(PipelineRegistry::new(
+            PathBuf::from(&args.config_path),
+            PathBuf::from(&args.state_arg),
+        ))
+    } else {
+        None
+    };
 
-    // 4. Start Web UI in background
-    spawn_web_server(app_state.clone(), args.web_port);
+    let app_state = AppState::new(history.clone(), reload_debounce.clone(), registry.clone());
 
-    // 5. Poll forever
-    log::info!("ETL Engine started. Polling every {}s...", poll_interval);
-    run_loop(
-        &pipeline,
-        &pipeline_state,
-        &persistent_state,
-        &app_state,
-        &args.state_path,
-        poll_interval,
-    )
-    .await;
+    let mut pipeline_count = 0usize;
+    for item in loaded {
+        let state_path = args.state_path_for(&item.id);
+        let id = item.id.clone();
+        register_and_spawn_pipeline(&app_state, &history, item.id, item.path, state_path, item.config)
+            .await
+            .unwrap_or_else(|e| {
+                log::error!("[{}] Failed to build pipeline: {}", id, e);
+                std::process::exit(1);
+            });
+        pipeline_count += 1;
+    }
+
+    let extra_watch_dirs = if registry.is_some() {
+        vec![PathBuf::from(&args.config_path)]
+    } else {
+        vec![]
+    };
+    spawn_config_watcher(
+        app_state.clone(),
+        history,
+        registry,
+        extra_watch_dirs,
+        reload_debounce,
+    );
+    spawn_web_server(app_state, args.web_port, auth_config);
+
+    log::info!("ETL Engine started with {} pipeline(s)", pipeline_count);
+
+    // Pipeline workers and the web server run as detached background tasks
+    // (new ones can be spawned any time via the API or the file watcher, so
+    // there's no fixed set to join on) — block forever, exiting only on
+    // process signal/kill.
+    std::future::pending::<()>().await;
 }
-
-// ---------------------------------------------------------------------------
-// Args
-// ---------------------------------------------------------------------------
 
 struct Args {
     config_path: String,
-    state_path: String,
+    state_arg: String,
+    legacy_state_file: bool,
     web_port: u16,
+}
+
+impl Args {
+    fn state_display(&self) -> &str {
+        &self.state_arg
+    }
+
+    fn state_path_for(&self, pipeline_id: &str) -> String {
+        if self.legacy_state_file {
+            self.state_arg.clone()
+        } else {
+            Path::new(&self.state_arg)
+                .join(format!("{}.json", pipeline_id))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
-    Args {
-        config_path: args
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| "config/pipeline.json".into()),
-        state_path: args
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| "etl_state.json".into()),
-        web_port: args
-            .get(3)
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(3000),
-    }
-}
+    let config_path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "config/pipeline.json".into());
 
-// ---------------------------------------------------------------------------
-// State helpers
-// ---------------------------------------------------------------------------
+    let state_raw = args.get(2).cloned();
+    let port_raw = args.get(3).cloned();
 
-fn restore_app_stats(app_state: &AppState, persistent_state: &Arc<Mutex<PersistentState>>) {
-    let ps = persistent_state.lock().unwrap();
-    log::info!(
-        "Loaded state: {} files already processed, last_run: {}",
-        ps.processed_files.len(),
-        ps.last_run
-    );
-    app_state.restore_stats(ps.total_rows_processed, ps.total_errors);
-}
-
-fn pipeline_state_from(persistent_state: &Arc<Mutex<PersistentState>>) -> Arc<Mutex<PipelineState>> {
-    let ps = persistent_state.lock().unwrap();
-    Arc::new(Mutex::new(PipelineState {
-        last_run: ps.last_run,
-        rows_processed: ps.total_rows_processed,
-        errors_count: ps.total_errors,
-    }))
-}
-
-fn save_state(persistent_state: &Arc<Mutex<PersistentState>>, path: &str) {
-    let snapshot = persistent_state.lock().unwrap().clone();
-    if let Err(e) = snapshot.save(path) {
-        log::warn!("Failed to save state: {}", e);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline builders
-// ---------------------------------------------------------------------------
-
-async fn build_extractor(
-    config: &PipelineConfig,
-    persistent_state: &Arc<Mutex<PersistentState>>,
-    state_path: &str,
-) -> (u64, Box<dyn Extractor>) {
-    match &config.source {
-        SourceConfig::Postgres {
-            connection_string,
-            query,
-            poll_interval_secs,
-        } => {
-            log::info!("Source: PostgreSQL");
-            let e = PostgresExtractor::connect(connection_string, query.clone())
-                .await
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to connect to source: {}", e);
-                    std::process::exit(1);
-                });
-            (*poll_interval_secs, Box::new(e))
+    let (state_arg, legacy_state_file, web_port) = match state_raw {
+        Some(s) if s.ends_with(".json") && !Path::new(&s).is_dir() => {
+            let port = port_raw
+                .as_deref()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3000);
+            (s, true, port)
         }
-        SourceConfig::Csv {
-            watch_dir,
-            processed_dir,
-            delimiter,
-            chunk_size,
-            poll_interval_secs,
-        } => {
-            log::info!("Source: CSV files from {}", watch_dir);
-            let e = CsvExtractor::new(
-                watch_dir,
-                processed_dir,
-                *delimiter,
-                *chunk_size,
-                Arc::clone(persistent_state),
-                state_path.to_string(),
-            )
-            .unwrap_or_else(|e| {
-                log::error!("Failed to initialize CSV extractor: {}", e);
-                std::process::exit(1);
-            });
-            (*poll_interval_secs, Box::new(e))
+        Some(s) => {
+            let port = port_raw
+                .as_deref()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3000);
+            (s, false, port)
         }
-        SourceConfig::ClickHouse {
-            host,
-            database,
-            query,
-            username,
-            password,
-            chunk_size,
-            poll_interval_secs,
-        } => {
-            log::info!("Source: ClickHouse at {} database {}", host, database);
-            let e = ClickHouseExtractor::new(
-                host.clone(),
-                database.clone(),
-                query.clone(),
-                username.clone(),
-                password.clone(),
-                *chunk_size,
-            )
-            .unwrap_or_else(|e| {
-                log::error!("Failed to initialize ClickHouse extractor: {}", e);
-                std::process::exit(1);
-            });
-            (*poll_interval_secs, Box::new(e))
-        }
-    }
-}
-
-fn build_transformers(config: &PipelineConfig) -> Vec<Box<dyn Transformer>> {
-    config
-        .transforms
-        .iter()
-        .map(|tc| -> Box<dyn Transformer> {
-            match tc {
-                TransformConfig::Filter { column, value } => {
-                    Box::new(FilterTransformer::new(column.clone(), value.clone()))
-                }
-                TransformConfig::Map { rename } => Box::new(MapTransformer::new(rename.clone())),
-                TransformConfig::Aggregate { group_by, sum } => {
-                    Box::new(AggregateTransformer::new(group_by.clone(), sum.clone()))
-                }
+        None => {
+            let config_is_dir = Path::new(&config_path).is_dir();
+            if config_is_dir {
+                ("etl_state".into(), false, 3000)
+            } else {
+                ("etl_state.json".into(), true, 3000)
             }
-        })
-        .collect()
-}
+        }
+    };
 
-fn chunk_size_from(config: &PipelineConfig) -> usize {
-    match &config.source {
-        SourceConfig::Csv { chunk_size, .. } => *chunk_size,
-        SourceConfig::ClickHouse { chunk_size, .. } => *chunk_size,
-        _ => 10_000,
+    Args {
+        config_path,
+        state_arg,
+        legacy_state_file,
+        web_port,
     }
 }
 
-async fn build_loader(config: &PipelineConfig) -> PostgresLoader {
-    log::info!("Connecting to destination DB...");
-    PostgresLoader::connect(
-        &config.destination.connection_string,
-        config.destination.table.clone(),
-        chunk_size_from(config),
-        config.destination.unique_key.clone(),
-    )
-    .await
-    .unwrap_or_else(|e| {
-        log::error!("Failed to connect to destination: {}", e);
-        std::process::exit(1);
-    })
+fn load_pipelines(args: &Args) -> Result<Vec<LoadedPipeline>, crate::error::EtlError> {
+    let path = Path::new(&args.config_path);
+    let loaded = if path.is_dir() {
+        load_configs_from_dir(&args.config_path)?
+    } else {
+        let config = load_config(&args.config_path)?;
+        let path_buf = PathBuf::from(&args.config_path);
+        let id = resolve_pipeline_id(&path_buf, &config);
+        vec![LoadedPipeline {
+            path: path_buf,
+            id,
+            config,
+        }]
+    };
+    validate_depends_on(&loaded)?;
+    Ok(loaded)
 }
 
-// ---------------------------------------------------------------------------
-// Web + poll loop
-// ---------------------------------------------------------------------------
-
-fn spawn_web_server(app_state: AppState, port: u16) {
+fn spawn_web_server(app_state: AppState, port: u16, auth_config: Option<auth::BasicAuthConfig>) {
     tokio::spawn(async move {
-        if let Err(e) = start_server(app_state, port).await {
+        if let Err(e) = start_server(app_state, port, auth_config).await {
             log::error!("Web server stopped: {}", e);
         }
     });
-}
-
-async fn run_loop(
-    pipeline: &Pipeline,
-    pipeline_state: &Arc<Mutex<PipelineState>>,
-    persistent_state: &Arc<Mutex<PersistentState>>,
-    app_state: &AppState,
-    state_path: &str,
-    poll_interval: u64,
-) {
-    loop {
-        app_state.set_status(PipelineStatus::Running);
-        let result = retry_with_backoff(3, 2, "pipeline", || pipeline.run(pipeline_state)).await;
-
-        match result {
-            // Nothing new this cycle
-            Ok(0) => {
-                app_state.set_status(PipelineStatus::Idle);
-                app_state.log("[INFO] No new data".into());
-                log::info!("No new data");
-            }
-            // Rows loaded — update UI + persist last_run / totals
-            Ok(count) => {
-                log::info!("Processed {} rows", count);
-                app_state.add_rows(count);
-                app_state.set_status(PipelineStatus::Idle);
-                app_state.log(format!("[INFO] Processed {} rows", count));
-
-                {
-                    let mut s = persistent_state.lock().unwrap();
-                    s.total_rows_processed += count;
-                    s.last_run = pipeline_state.lock().unwrap().last_run;
-                }
-                save_state(persistent_state, state_path);
-            }
-            // Failure — count error and keep going next poll
-            Err(e) => {
-                log::error!("Pipeline error: {}", e);
-                app_state.add_error();
-                app_state.set_status(PipelineStatus::Error(e.to_string()));
-                app_state.log(format!("[ERROR] {}", e));
-
-                persistent_state.lock().unwrap().total_errors += 1;
-                save_state(persistent_state, state_path);
-            }
-        }
-
-        sleep(Duration::from_secs(poll_interval)).await;
-    }
 }
