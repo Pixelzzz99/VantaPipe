@@ -18,6 +18,7 @@ pub type Row = HashMap<String, Value>;
  *   - Преобразует каждый ключ в String и собирает пары в HashMap, который представляет собой
  *   строку (Row).
  */
+#[cfg(test)]
 pub fn make_row(pairs: Vec<(&str, Value)>) -> Row {
     pairs
         .into_iter()
@@ -25,6 +26,7 @@ pub fn make_row(pairs: Vec<(&str, Value)>) -> Row {
         .collect()
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 

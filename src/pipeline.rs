@@ -10,15 +10,14 @@ use crate::loader::Loader;
 pub struct PipelineState {
     pub last_run: DateTime<Utc>,
     pub rows_processed: u64,
-    pub errors_count: u64,
 }
 
 impl PipelineState {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             last_run: Utc::now() - chrono::Duration::days(1),
             rows_processed: 0,
-            errors_count: 0,
         }
     }
 }

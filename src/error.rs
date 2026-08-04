@@ -4,7 +4,6 @@ use std::fmt;
 pub enum EtlError {
     ConnectionError(String),
     QueryError(String),
-    TransformError(String),
     ConfigError(String),
     LoadError(String),
 }
@@ -14,9 +13,19 @@ impl fmt::Display for EtlError {
         match self {
             EtlError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
             EtlError::QueryError(msg) => write!(f, "Query error: {}", msg),
-            EtlError::TransformError(msg) => write!(f, "Transform error: {}", msg),
             EtlError::ConfigError(msg) => write!(f, "Config error: {}", msg),
             EtlError::LoadError(msg) => write!(f, "Load error: {}", msg),
+        }
+    }
+}
+
+impl EtlError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EtlError::ConnectionError(_) => "connection",
+            EtlError::QueryError(_) => "query",
+            EtlError::ConfigError(_) => "config",
+            EtlError::LoadError(_) => "load",
         }
     }
 }
@@ -51,7 +60,6 @@ mod tests {
         let errors = vec![
             EtlError::ConnectionError('c'.to_string()),
             EtlError::QueryError('q'.to_string()),
-            EtlError::TransformError('t'.to_string()),
             EtlError::ConfigError('g'.to_string()),
             EtlError::LoadError('l'.to_string()),
         ];
@@ -59,5 +67,13 @@ mod tests {
         for err in errors {
             assert!(!err.to_string().is_empty(), "Error message should not be empty");
         }
+    }
+
+    #[test]
+    fn test_error_kind() {
+        assert_eq!(EtlError::ConnectionError("x".to_string()).kind(), "connection");
+        assert_eq!(EtlError::QueryError("x".to_string()).kind(), "query");
+        assert_eq!(EtlError::ConfigError("x".to_string()).kind(), "config");
+        assert_eq!(EtlError::LoadError("x".to_string()).kind(), "load");
     }
 }
