@@ -1,2 +1,9 @@
 /target
 /data
+.DS_Store
+/etl_state
+/etl_state.json
+/etl_state_*.json
+/history
+/config/active
+/graphify-out
