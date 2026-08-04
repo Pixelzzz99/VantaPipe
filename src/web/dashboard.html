@@ -117,6 +117,12 @@
                                         @click="ctrl(p.id,'stop')" x-html="ICONS.square"></button>
                                 <button class="p-1.5 bg-emerald-700 hover:bg-emerald-600 rounded"
                                         title="Run now" @click="ctrl(p.id,'run')" x-html="ICONS.refresh"></button>
+                                <button x-show="deletingId !== p.id"
+                                        class="p-1.5 bg-gray-800 hover:bg-red-900/60 hover:text-red-400 rounded"
+                                        title="Delete" @click="confirmDelete(p.id)" x-html="ICONS.trash"></button>
+                                <button x-show="deletingId === p.id"
+                                        class="px-2 py-1.5 bg-red-700 hover:bg-red-600 rounded text-[11px] font-medium whitespace-nowrap"
+                                        @click="confirmDelete(p.id)">Confirm delete?</button>
                             </div>
                         </td>
                     </tr>
@@ -175,9 +181,13 @@
                             <label class="block text-xs text-gray-500 mb-1">Schedule preset</label>
                             <select x-model="form.cronPreset" @change="onCronPresetChange()"
                                     class="w-full bg-gray-950 border border-gray-800 rounded px-2 py-1.5 text-sm">
-                                <template x-for="p in CRON_PRESETS" :key="p.value">
-                                    <option :value="p.value" x-text="p.label"></option>
-                                </template>
+                                <option value="*/10 * * * * *">Every 10 seconds</option>
+                                <option value="*/30 * * * * *">Every 30 seconds</option>
+                                <option value="0 * * * * *">Every minute</option>
+                                <option value="0 */5 * * * *">Every 5 minutes</option>
+                                <option value="0 0 * * * *">Every hour</option>
+                                <option value="0 0 0 * * *">Daily at midnight</option>
+                                <option value="custom">Custom</option>
                             </select>
                         </div>
                         <div>
@@ -452,6 +462,7 @@
             file: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4"><path d="M6 2h9l5 5v13a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z"></path><polyline points="15 2 15 7 20 7"></polyline></svg>',
             plus: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>',
             x: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
+            trash: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"></path></svg>',
         };
 
         const STATUS_META = {
@@ -531,6 +542,7 @@
                 ganttTicks: [],
                 ganttRangeHours: 1,
                 hoveredBar: null,
+                deletingId: null,
                 wsConnected: false,
                 ws: null,
                 ICONS,
@@ -583,6 +595,34 @@
                 async ctrl(id, action) {
                     await fetch(`/api/pipelines/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
                     await this.fetchStatus();
+                },
+
+                confirmDelete(id) {
+                    if (this.deletingId === id) {
+                        this.deletePipeline(id);
+                        return;
+                    }
+                    this.deletingId = id;
+                    setTimeout(() => {
+                        if (this.deletingId === id) this.deletingId = null;
+                    }, 4000);
+                },
+
+                async deletePipeline(id) {
+                    this.deletingId = null;
+                    try {
+                        const r = await fetch(`/api/pipelines/${encodeURIComponent(id)}`, { method: 'DELETE' });
+                        const data = await r.json();
+                        if (!r.ok) throw new Error(data.error || 'delete failed');
+                        if (this.selectedId === id) {
+                            this.selectedId = '';
+                            this.configText = '';
+                            this.form = this.defaultForm();
+                        }
+                        await this.fetchStatus();
+                    } catch (e) {
+                        this.editorMsg = { ok: false, text: String(e.message || e) };
+                    }
                 },
 
                 selectPipeline(id) {

@@ -123,6 +123,23 @@ impl AppState {
         }
     }
 
+    /// Removes the pipeline from the live set and drops its control
+    /// sender, which closes `WorkerContext.cmd_rx` — the worker's
+    /// `cmd_rx.recv()` then returns `None` and `run_pipeline_worker`
+    /// exits its loop on its own, no separate shutdown command needed.
+    /// Returns `false` if the id wasn't registered.
+    pub fn unregister_pipeline(&self, id: &str) -> bool {
+        let existed = self
+            .inner
+            .write()
+            .map(|mut inner| inner.pipelines.remove(id).is_some())
+            .unwrap_or(false);
+        if let Ok(mut controls) = self.controls.write() {
+            controls.remove(id);
+        }
+        existed
+    }
+
     pub fn config_path(&self, id: &str) -> Option<String> {
         let inner = self.inner.read().unwrap();
         inner.pipelines.get(id).map(|p| p.config_path.clone())
@@ -222,7 +239,7 @@ pub async fn start_server(
 ) -> Result<(), std::io::Error> {
     use axum::{
         Router, middleware,
-        routing::{get, post},
+        routing::{delete, get, post},
     };
     use tower_http::cors::CorsLayer;
 
@@ -232,6 +249,7 @@ pub async fn start_server(
         .route("/", get(handlers::dashboard))
         .route("/api/status", get(handlers::status))
         .route("/api/pipelines", post(handlers::create_pipeline))
+        .route("/api/pipelines/:id", delete(handlers::delete_pipeline))
         .route("/api/logs", get(handlers::logs))
         .route("/api/history", get(handlers::all_history))
         .route("/api/pipelines/:id/pause", post(handlers::pause))
