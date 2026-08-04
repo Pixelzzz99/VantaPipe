@@ -171,6 +171,14 @@ pub fn spawn_config_watcher(
 
                 let Some(registry) = &registry else { continue };
 
+                // A delete (e.g. via `DELETE /api/pipelines/:id`) fires a
+                // filesystem event too; the file's gone by the time we get
+                // here, so there's nothing to register — skip quietly
+                // rather than logging a spurious "invalid config" warning.
+                if !path.exists() {
+                    continue;
+                }
+
                 let path_str = path.to_string_lossy().to_string();
                 let config = match load_config(&path_str) {
                     Ok(c) => c,

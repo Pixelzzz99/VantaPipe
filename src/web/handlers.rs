@@ -190,6 +190,42 @@ pub async fn create_pipeline(
     }
 }
 
+/// Deregister a pipeline at runtime: stops its worker (by dropping its
+/// control channel — see `AppState::unregister_pipeline`), removes it from
+/// the dashboard/API, and deletes its config + state files. Only available
+/// in directory mode, mirroring `create_pipeline`.
+pub async fn delete_pipeline(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(registry) = state.registry.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Dynamic pipeline deregistration requires directory mode (started with a config directory, not a single file)"
+            })),
+        )
+            .into_response();
+    };
+
+    if state.config_path(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pipeline not found"})),
+        )
+            .into_response();
+    }
+
+    state.unregister_pipeline(&id);
+
+    let config_path = registry.config_dir.join(format!("{}.json", id));
+    let _ = std::fs::remove_file(&config_path);
+    let state_path = registry.state_dir.join(format!("{}.json", id));
+    let _ = std::fs::remove_file(&state_path);
+
+    Json(serde_json::json!({"ok": true, "id": id})).into_response()
+}
+
 pub async fn get_config(
     State(state): State<AppState>,
     Path(id): Path<String>,
