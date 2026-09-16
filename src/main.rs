@@ -1,4 +1,3 @@
-mod auth;
 mod config;
 mod error;
 mod extractor;
@@ -32,19 +31,10 @@ async fn main() {
     let args = parse_args();
     log::info!("Config: {}", args.config_path);
     log::info!("State: {}", args.state_display());
-    log::info!("Web UI: http://localhost:{}", args.web_port);
-
-    let auth_config = auth::BasicAuthConfig::from_env().unwrap_or_else(|e| {
-        log::error!("Invalid auth configuration: {}", e);
-        std::process::exit(1);
-    });
-    match &auth_config {
-        Some(cfg) => log::info!("API authentication enabled for user '{}'", cfg.username),
-        None => log::warn!(
-            "API authentication is disabled — set ETL_AUTH_USER and ETL_AUTH_PASS \
-             to protect the dashboard/API before exposing this port beyond localhost."
-        ),
-    }
+    log::info!(
+        "Internal API (not for direct public exposure — front it with the Node gateway): http://localhost:{}",
+        args.web_port
+    );
 
     let loaded = load_pipelines(&args).unwrap_or_else(|e| {
         log::error!("Failed to load config(s): {}", e);
@@ -95,7 +85,7 @@ async fn main() {
         extra_watch_dirs,
         reload_debounce,
     );
-    spawn_web_server(app_state, args.web_port, auth_config);
+    spawn_web_server(app_state, args.web_port);
 
     log::info!("ETL Engine started with {} pipeline(s)", pipeline_count);
 
@@ -191,9 +181,9 @@ fn load_pipelines(args: &Args) -> Result<Vec<LoadedPipeline>, crate::error::EtlE
     Ok(loaded)
 }
 
-fn spawn_web_server(app_state: AppState, port: u16, auth_config: Option<auth::BasicAuthConfig>) {
+fn spawn_web_server(app_state: AppState, port: u16) {
     tokio::spawn(async move {
-        if let Err(e) = start_server(app_state, port, auth_config).await {
+        if let Err(e) = start_server(app_state, port).await {
             log::error!("Web server stopped: {}", e);
         }
     });

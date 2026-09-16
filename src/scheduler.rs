@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use cron::Schedule;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::config::{DependsOnEntry, load_config};
@@ -49,6 +49,11 @@ pub struct WorkerContext {
     pub app_state: AppState,
     pub history: RunHistoryStore,
     pub cmd_rx: mpsc::Receiver<PipelineCommand>,
+    /// Fires with a pipeline id whenever that pipeline finishes a real
+    /// success (see `AppState::success_tx`). Lets this worker react to a
+    /// dependency succeeding immediately rather than waiting for its own
+    /// next scheduled tick.
+    pub dep_rx: broadcast::Receiver<String>,
 }
 
 /// Run forever: schedule ticks + control commands (pause/stop/trigger/reload).
@@ -99,6 +104,17 @@ pub async fn run_pipeline_worker(mut ctx: WorkerContext) {
                         break;
                     }
                 }
+            }
+            event = ctx.dep_rx.recv() => {
+                if let Ok(finished_id) = event {
+                    let depends_on = ctx.depends_on.read().unwrap().clone();
+                    if depends_on.iter().any(|d| d.id() == finished_id) {
+                        try_schedule_tick(&ctx, &running, mode, false).await;
+                    }
+                }
+                // Err(Lagged)/Err(Closed): ignore — the pipeline's own
+                // scheduled tick remains the fallback that eventually
+                // re-checks depends_on.
             }
         }
     }
@@ -286,6 +302,10 @@ async fn run_once(
                 error: None,
                 error_kind: None,
             });
+            // Wake up any dependents waiting on this pipeline (see
+            // `WorkerContext.dep_rx`) instead of making them poll on
+            // their own schedule.
+            app_state.success_tx.send(id.to_string()).ok();
         }
         Err(e) => {
             log::error!("[{}] Pipeline error: {}", id, e);
@@ -596,6 +616,7 @@ mod tests {
             app_state: app_state.clone(),
             history,
             cmd_rx: mpsc::channel(1).1,
+            dep_rx: app_state.subscribe_success(),
         };
         let running = Arc::new(AtomicBool::new(false));
 
@@ -607,5 +628,59 @@ mod tests {
             }
             other => panic!("expected Blocked status, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_downstream_triggers_immediately_on_upstream_success() {
+        let history = test_history_store("dag_trigger");
+        let app_state = AppState::new(history.clone(), Default::default(), None);
+        app_state.register_pipeline(
+            "downstream".to_string(),
+            "downstream.json".to_string(),
+            "every 3600s".to_string(),
+            0,
+            0,
+        );
+
+        let pipeline = Pipeline::new(Box::new(StubExtractor), vec![], Box::new(StubLoader));
+        // Kept alive for the whole test: dropping the sender closes
+        // cmd_rx, which the worker loop treats as a shutdown signal.
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let ctx = WorkerContext {
+            id: "downstream".to_string(),
+            config_path: "downstream.json".to_string(),
+            state_path: "downstream_state.json".to_string(),
+            pipeline: Arc::new(RwLock::new(Arc::new(pipeline))),
+            // Effectively "never" within this test — proves the second
+            // tick below comes from the broadcast, not the timer.
+            schedule: Arc::new(RwLock::new(ScheduleMode::Interval(3600))),
+            depends_on: Arc::new(RwLock::new(vec![simple_dep("upstream")])),
+            pipeline_state: Arc::new(Mutex::new(crate::pipeline::PipelineState::new())),
+            persistent_state: Arc::new(Mutex::new(PersistentState::new())),
+            app_state: app_state.clone(),
+            history: history.clone(),
+            cmd_rx,
+            dep_rx: app_state.subscribe_success(),
+        };
+
+        tokio::spawn(run_pipeline_worker(ctx));
+
+        // Initial forced startup tick (bypasses the depends_on gate).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            history.for_pipeline("downstream").len(),
+            1,
+            "expected exactly the initial forced startup tick"
+        );
+
+        history.record_finished(record("upstream", RunOutcome::Success));
+        app_state.success_tx.send("upstream".to_string()).ok();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            history.for_pipeline("downstream").len(),
+            2,
+            "expected a second tick triggered by the upstream success broadcast, not the 3600s timer"
+        );
     }
 }

@@ -9,17 +9,56 @@ services:
       - "5434:5432"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U etl -d etldb"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+    ports:
+      - "8123:8123" # HTTP interface (used by ClickHouseExtractor)
+      - "9001:9000" # native protocol (optional, for clickhouse-client)
+    volumes:
+      - ./data/clickhouse:/var/lib/clickhouse
+      - ./docker/clickhouse-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Interactive SQL shell against the clickhouse service. Not started by
+  # `docker compose up` (needs a real terminal attached). Run it with:
+  #   docker compose run --rm clickhouse-client
+  clickhouse-client:
+    profiles: ["tools"]
+    image: clickhouse/clickhouse-server:24.3-alpine
+    entrypoint: ["clickhouse-client", "--host", "clickhouse", "--user", "default", "--password", "clickhouse"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+
+  # Internal-only ETL engine. Not started by default (`docker compose up`
+  # only brings up postgres + clickhouse) — run with `docker compose
+  # --profile app up` once you've picked/edited a pipeline config. No
+  # `ports:` mapping on purpose: only the `server` gateway (over the
+  # compose network) can reach it, never the host directly.
   etl-engine:
+    profiles: ["app"]
     build: .
     image: etl-engine:latest
     depends_on:
       postgres:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     environment:
       RUST_LOG: info
@@ -27,4 +66,21 @@ services:
       - ./docker:/app/config:ro
       - ./data:/app/data
     command: ["/app/config/pipeline.json", "/app/data/etl_state.json"]
+    restart: unless-stopped
+
+  # Public-facing Node gateway: dashboard + Basic Auth + reverse proxy to
+  # `etl-engine`'s internal API (see server/README or the plan for design).
+  server:
+    profiles: ["app"]
+    build: ./server
+    image: dataflow-rs-gateway:latest
+    depends_on:
+      - etl-engine
+    environment:
+      PORT: 3000
+      ETL_ENGINE_URL: http://etl-engine:3000
+      # ETL_AUTH_USER: admin
+      # ETL_AUTH_PASS: change-me
+    ports:
+      - "3000:3000"
     restart: unless-stopped
