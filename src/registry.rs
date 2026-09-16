@@ -110,6 +110,7 @@ pub async fn register_and_spawn_pipeline(
         app_state: app_state.clone(),
         history: history.clone(),
         cmd_rx,
+        dep_rx: app_state.subscribe_success(),
     };
 
     tokio::spawn(run_pipeline_worker(ctx));

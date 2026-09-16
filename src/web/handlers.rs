@@ -1,16 +1,12 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{IntoResponse, Json},
 };
 
 use crate::config::{load_config, parse_cron_schedule};
 use crate::scheduler::PipelineCommand;
 use crate::web::AppState;
-
-pub async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("dashboard.html"))
-}
 
 pub async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let response = state.get_status_response();

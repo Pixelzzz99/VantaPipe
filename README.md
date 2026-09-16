@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-**JSON pipelines. One Rust binary.**
+**JSON pipelines. A Rust engine, a thin Node.js gateway.**
 
-Async **ETL** (Extract → Transform → Load): poll, transform, and load data with a config file — Postgres, ClickHouse, CSV — plus incremental state, retries, and a live Web dashboard. No code changes needed to reconfigure the pipeline.
+Async **ETL** (Extract → Transform → Load): poll, transform, and load data with a config file — Postgres, ClickHouse, CSV — plus incremental state, retries, and a live Web dashboard. No code changes needed to reconfigure the pipeline. The Rust engine owns all ETL/scheduling logic behind an internal-only API; a small Node.js gateway (`server/`) is the public surface — dashboard, auth, reverse proxy. See [Architecture](#architecture).
 
 ---
 
@@ -18,7 +18,7 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 | **Destination** | PostgreSQL (batched inserts, optional upsert via `unique_key`) |
 | **Multi-pipeline** | Load one JSON file or a directory of `*.json` configs |
 | **Dynamic registration** | Directory mode can start with **zero** pipelines and grow at runtime — via `POST /api/pipelines` or by dropping a new `*.json` file into the config directory — no restart |
-| **Dependencies** | `depends_on` — a pipeline only ticks once its dependencies last succeeded (optionally within a freshness window); cycles and unknown ids are rejected at load *and* reload time |
+| **Dependencies** | `depends_on` — a pipeline only ticks once its dependencies last succeeded (optionally within a freshness window); a dependent triggers **immediately** on a dependency's success, not just on its own next tick; cycles and unknown ids are rejected at load *and* reload time |
 | **Scheduling** | Fixed interval (`poll_interval_secs`) or cron (`schedule`) per pipeline |
 | **Parallel** | One Tokio worker per pipeline; overlapping ticks are **skipped** |
 | **Controls** | Soft Pause / Resume / Stop + Run-once from the Web UI |
@@ -38,7 +38,21 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) **1.85+** (edition 2024)
+- [Node.js](https://nodejs.org/) 20+ (for the gateway — see [Architecture](#architecture))
 - PostgreSQL for the destination (and for Postgres sources)
+
+### Architecture
+
+Two processes: the Rust **engine** does all ETL/scheduling work and exposes
+an **internal-only** HTTP+WebSocket API (no auth, not meant to be reachable
+from outside your network); the Node **gateway** (`server/`) is the public
+surface — it serves the dashboard, does Basic Auth, and reverse-proxies
+everything else straight through to the engine. Never expose the engine's
+port directly; always front it with the gateway.
+
+```
+Browser → Node gateway (public port, auth) → Rust engine (internal port) → Postgres/ClickHouse/CSV
+```
 
 ### Build & run
 
@@ -47,17 +61,21 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 git clone https://github.com/Pixelzzz99/dataflow-rs.git
 cd dataflow-rs
 
-# Build
+# Build the engine
 cargo build --release
 
-# Single pipeline (legacy-friendly: state file ends with .json)
-RUST_LOG=info cargo run -- config/pipeline_csv.json etl_state.json 3456
+# Terminal 1 — engine (internal port, single pipeline; legacy-friendly:
+# state file ends with .json)
+RUST_LOG=info cargo run -- config/pipeline_csv.json etl_state.json 4000
+# ...or multiple pipelines from a directory (state dir + per-id files):
+RUST_LOG=info cargo run -- config/active etl_state 4000
 
-# Multiple pipelines from a directory (state dir + per-id files)
-RUST_LOG=info cargo run -- config/active etl_state 3456
+# Terminal 2 — gateway
+cd server && npm install
+ETL_ENGINE_URL=http://localhost:4000 PORT=3456 npm start
 ```
 
-Open the dashboard: **http://localhost:3456**
+Open the dashboard: **http://localhost:3456** (the gateway's port — not the engine's)
 
 ### CLI arguments
 
@@ -68,7 +86,9 @@ CONFIG       Pipeline JSON file or directory of *.json   (default: config/pipeli
 STATE        If ends with .json → single state file (legacy)
              Otherwise → directory; writes {id}.json per pipeline
              Defaults: etl_state.json (file mode) or etl_state/ (dir mode)
-PORT         Web UI port                                 (default: 3000)
+PORT         Internal API port                            (default: 3000)
+             Not for direct browser access — front it with the Node
+             gateway in server/ (see Architecture above).
 ```
 
 **Overlap policy:** if a pipeline is still running when the next interval/cron tick fires, that tick is **skipped** (logged as a warning). No backlog queue.
@@ -122,6 +142,11 @@ mkdir -p config/active   # can be empty
 RUST_LOG=info cargo run -- config/active etl_state 3456
 ```
 
+(The `curl` examples below hit the engine's port directly, which is fine
+for local dev/testing — same as running the two processes side by side in
+[Quick start](#quick-start). Through the gateway, the exact same requests
+just go to the gateway's port instead, with auth if enabled.)
+
 ...and then add pipelines while it's running, two ways:
 
 **1. Drop a new file into the same directory** — the file watcher notices any
@@ -161,17 +186,25 @@ no directory to add a file to).
 
 ### Authentication
 
-No authentication by default — fine for local/trusted-network use, but the dashboard can trigger runs, pause pipelines, and rewrite config files (including connection strings), so **do not expose the port beyond localhost without enabling auth**.
+Auth lives entirely in the **gateway** (`server/`), not the engine — the
+engine has no auth of its own and is never meant to be reachable except
+from the gateway. No authentication by default on the gateway either —
+fine for local/trusted-network use, but the dashboard can trigger runs,
+pause pipelines, and rewrite config files (including connection strings),
+so **do not expose the gateway's port beyond localhost without enabling
+auth**.
 
-Set both env vars to turn on HTTP Basic Auth for the entire app (dashboard + every `/api/*` route):
+Set both env vars on the gateway to turn on HTTP Basic Auth for the entire
+app (dashboard + every proxied `/api/*` route + the `/ws/logs` WebSocket):
 
 ```bash
-ETL_AUTH_USER=admin ETL_AUTH_PASS=change-me RUST_LOG=info \
-  cargo run -- config/pipeline_csv.json etl_state.json 3456
+cd server
+ETL_AUTH_USER=admin ETL_AUTH_PASS=change-me \
+  ETL_ENGINE_URL=http://localhost:4000 PORT=3456 npm start
 ```
 
 - Neither set → auth disabled (default), a warning is logged at startup.
-- Only one set → the process refuses to start (fail-fast, rather than run half-protected).
+- Only one set → the gateway refuses to start (fail-fast, rather than run half-protected).
 - Browsers prompt for credentials natively on first visit and cache them for the origin; no changes needed to use the dashboard once logged in. `curl` clients: `curl -u admin:change-me http://localhost:3456/api/status`.
 
 ---
@@ -236,7 +269,7 @@ Optional: make a pipeline wait for one or more others to have last succeeded bef
 - Bare string (`"upstream_a"`) — satisfied by *any* past success of that pipeline, however old.
 - Object form — also requires that success to be no older than `max_staleness_secs`.
 - A dependency with no run history yet, or whose most recent run did not succeed (even if an earlier one did), blocks the tick.
-- Checked at every scheduled tick — not a one-time ordering at startup. A manual **Run** always bypasses it.
+- Checked at every scheduled tick, **and immediately when a dependency succeeds** — a successful run broadcasts to its dependents, so `downstream` doesn't wait for its own next tick to notice `upstream` finished. A manual **Run** always bypasses the gate (for both the pipeline you trigger and, if it succeeds, still wakes up its own dependents).
 - Validated at load time and again at every hot-reload (via the API or editing the file on disk): unknown ids, self-dependency, and dependency cycles are all rejected before the change takes effect — the previous, valid pipeline keeps running.
 - Not validated: dependency cycles are the only structural check; there's no staleness-window-aware backfill or catch-up scheduling — `max_staleness_secs` is a simple age check on the dependency's last success.
 
@@ -328,25 +361,36 @@ Use `{last_run}` in the query template; it is replaced with the last run timesta
 
 ## Docker
 
-Start destination Postgres + the engine:
-
 ```bash
+# Postgres + ClickHouse only (default profile — for local dev against the
+# engine run via `cargo run`, or for exploring the seed data)
 docker compose up --build
+
+# Full stack: Postgres + ClickHouse + engine (internal-only) + gateway
+docker compose --profile app up --build
 ```
 
 - Postgres: `localhost:5434` (`etl` / `etlpassword` / `etldb`)
+- ClickHouse: `localhost:8123` (HTTP), see `docker/clickhouse-init/`
+- Gateway (public, dashboard + auth): `localhost:3000`
+- Engine: **no published port** — only the `server` (gateway) container can
+  reach it, over the compose network at `http://etl-engine:3000`
 - Engine config mounted from `./docker`
 - Data & state under `./data`
 
-Or build the image alone:
+Or run the engine image alone (still internal-only in spirit — pair it with
+the gateway, don't publish this port to untrusted networks):
 
 ```bash
 docker build -t etl-engine .
 docker run --rm -e RUST_LOG=info \
   -v "$(pwd)/config:/app/config:ro" \
   -v "$(pwd)/data:/app/data" \
-  -p 3000:3000 \
+  -p 4000:3000 \
   etl-engine /app/config/pipeline_csv.json /app/data/etl_state.json 3000
+
+# then, separately:
+cd server && ETL_ENGINE_URL=http://localhost:4000 npm start
 ```
 
 ---
@@ -359,11 +403,10 @@ docker run --rm -e RUST_LOG=info \
 ├── docker/                 # Compose-mounted config
 ├── src/
 │   ├── main.rs             # CLI + startup wiring
-│   ├── auth.rs             # Optional HTTP Basic Auth
 │   ├── config.rs           # JSON config types + dir loader + depends_on validation
 │   ├── registry.rs         # Build+register+spawn a pipeline (startup, API, or watcher)
 │   ├── runtime.rs          # Build extractor/transform/loader
-│   ├── scheduler.rs        # Interval / cron + soft controls + depends_on gate
+│   ├── scheduler.rs        # Interval / cron + soft controls + depends_on gate + DAG-trigger broadcast
 │   ├── history.rs          # Run history ring + JSONL
 │   ├── watcher.rs          # Config file hot-reload + new-pipeline auto-registration
 │   ├── pipeline.rs         # Extract → transform → load
@@ -372,9 +415,16 @@ docker run --rm -e RUST_LOG=info \
 │   ├── loader/             # Postgres loader
 │   ├── state.rs            # Persistent state + log buffer
 │   ├── retry.rs            # Backoff retries
-│   └── web/                # Dashboard, control API, WebSocket logs
+│   └── web/                # Internal control API + WebSocket logs (no auth, no dashboard route)
+├── server/                 # Node.js gateway — public surface: dashboard, auth, reverse proxy
+│   ├── src/
+│   │   ├── index.js        # Express wiring: static dashboard, auth, proxy, listen
+│   │   ├── auth.js         # Basic Auth (ETL_AUTH_USER/PASS)
+│   │   └── proxy.js        # REST + WebSocket proxy to the engine
+│   ├── public/dashboard.html
+│   └── Dockerfile
 ├── docker-compose.yml
-└── Dockerfile
+└── Dockerfile               # builds the Rust engine image
 ```
 
 ---

@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,6 +21,12 @@ pub struct AppState {
     /// `Some` in directory mode — lets the API and file watcher register
     /// brand-new pipelines at runtime. `None` in legacy single-file mode.
     pub registry: Option<PipelineRegistry>,
+    /// Broadcasts a pipeline id every time it finishes a run with real
+    /// rows processed (`RunOutcome::Success`, not `Empty`). Every worker
+    /// subscribes (see `subscribe_success`) so a `depends_on` dependent
+    /// can re-check and tick immediately instead of waiting for its own
+    /// next scheduled tick — see `scheduler::run_pipeline_worker`.
+    pub success_tx: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -71,6 +77,7 @@ impl AppState {
         reload_debounce: ReloadDebounce,
         registry: Option<PipelineRegistry>,
     ) -> Self {
+        let (success_tx, _) = broadcast::channel(64);
         Self {
             inner: Arc::new(RwLock::new(AppStateInner {
                 started_at: Instant::now(),
@@ -81,7 +88,15 @@ impl AppState {
             history,
             reload_debounce,
             registry,
+            success_tx,
         }
+    }
+
+    /// New receiver for "pipeline X just succeeded" events. Subscribed by
+    /// every worker at spawn time so dependents can react immediately
+    /// instead of waiting for their own next scheduled tick.
+    pub fn subscribe_success(&self) -> broadcast::Receiver<String> {
+        self.success_tx.subscribe()
     }
 
     pub fn register_control(&self, id: String, tx: mpsc::Sender<PipelineCommand>) {
@@ -232,21 +247,18 @@ impl AppState {
     }
 }
 
-pub async fn start_server(
-    state: AppState,
-    port: u16,
-    auth_config: Option<crate::auth::BasicAuthConfig>,
-) -> Result<(), std::io::Error> {
+/// Internal-only API server: no auth, no CORS, no dashboard route. Meant
+/// to be reached only by the Node gateway (see `server/`), which owns the
+/// public surface — Basic Auth, serving `dashboard.html`, and reverse
+/// proxying everything below straight through to this router. Do not
+/// expose this port directly (e.g. don't publish it in docker-compose).
+pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Error> {
     use axum::{
-        Router, middleware,
+        Router,
         routing::{delete, get, post},
     };
-    use tower_http::cors::CorsLayer;
-
-    let auth_state = Arc::new(auth_config);
 
     let app = Router::new()
-        .route("/", get(handlers::dashboard))
         .route("/api/status", get(handlers::status))
         .route("/api/pipelines", post(handlers::create_pipeline))
         .route("/api/pipelines/:id", delete(handlers::delete_pipeline))
@@ -262,11 +274,6 @@ pub async fn start_server(
         )
         .route("/api/pipelines/:id/history", get(handlers::pipeline_history))
         .route("/ws/logs", get(ws::ws_handler))
-        .layer(CorsLayer::permissive())
-        .layer(middleware::from_fn_with_state(
-            auth_state,
-            crate::auth::require_basic_auth,
-        ))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -275,7 +282,7 @@ pub async fn start_server(
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             log::error!(
                 "Port {} is already in use (another process is listening). \
-                 Web UI will not start. Try a different port: \
+                 Internal API will not start. Try a different port: \
                  cargo run -- <config> <state> <port>",
                 port
             );
@@ -284,6 +291,6 @@ pub async fn start_server(
         Err(e) => return Err(e),
     };
 
-    log::info!("Web UI running at http://localhost:{}", port);
+    log::info!("Internal API listening at http://localhost:{}", port);
     axum::serve(listener, app).await
 }
