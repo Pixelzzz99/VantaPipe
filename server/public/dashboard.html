@@ -268,6 +268,7 @@
                                         <option value="filter">Filter</option>
                                         <option value="map">Rename columns (map)</option>
                                         <option value="aggregate">Aggregate</option>
+                                        <option value="custom">Custom JS</option>
                                     </select>
                                     <button class="p-1 text-gray-500 hover:text-red-400" @click="removeTransform(ti)" x-html="ICONS.x"></button>
                                 </div>
@@ -298,6 +299,18 @@
                                         </div>
                                     </template>
                                     <button class="text-xs text-emerald-400 hover:text-emerald-300" @click="addMapPair(ti)">+ Add rename</button>
+                                </div>
+
+                                <div x-show="t.type === 'custom'" class="space-y-1.5">
+                                    <input type="text" x-model="t.script" placeholder="scripts/my_transform.js (path to .js file)"
+                                           class="w-full bg-gray-950 border border-gray-800 rounded px-2 py-1 text-xs mono">
+                                    <div class="grid grid-cols-2 gap-2">
+                                        <input type="text" x-model="t.function" placeholder="function name (default: transform)"
+                                               class="bg-gray-950 border border-gray-800 rounded px-2 py-1 text-xs mono">
+                                        <input type="number" x-model="t.timeout_ms" placeholder="timeout, ms (default: 5000)"
+                                               class="bg-gray-950 border border-gray-800 rounded px-2 py-1 text-xs">
+                                    </div>
+                                    <p class="text-[11px] text-gray-600">Script must define <code>function &lt;name&gt;(rows) {{ ... return rows; }}</code> — re-read from disk on every tick, no reload needed after edits.</p>
                                 </div>
                             </div>
                         </template>
@@ -819,6 +832,14 @@
                             (t.pairs || []).forEach(p => { if (p.from) rename[p.from] = p.to || ''; });
                             return { type: 'map', rename };
                         }
+                        if (t.type === 'custom') {
+                            const step = { type: 'custom', script: t.script || '' };
+                            if (t.function) step.function = t.function;
+                            if (t.timeout_ms !== '' && t.timeout_ms !== null && t.timeout_ms !== undefined) {
+                                step.timeout_ms = Number(t.timeout_ms);
+                            }
+                            return step;
+                        }
                         return t;
                     });
 
@@ -866,6 +887,7 @@
                     if (type === 'filter') { fresh.column = ''; fresh.value = ''; }
                     if (type === 'aggregate') { fresh.group_by = ''; fresh.sum = ''; }
                     if (type === 'map') { fresh.pairs = [{ from: '', to: '' }]; }
+                    if (type === 'custom') { fresh.script = ''; fresh.function = ''; fresh.timeout_ms = ''; }
                     this.form.transforms[idx] = fresh;
                 },
 

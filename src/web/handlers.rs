@@ -18,6 +18,10 @@ pub async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+pub async fn metrics(State(state): State<AppState>) -> String {
+    state.prometheus_handle.render()
+}
+
 pub async fn logs(State(state): State<AppState>) -> Json<serde_json::Value> {
     let logs = state.get_logs();
     Json(serde_json::json!({"logs": logs}))

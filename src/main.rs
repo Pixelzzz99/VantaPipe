@@ -20,13 +20,21 @@ use config::{
     LoadedPipeline, load_config, load_configs_from_dir, resolve_pipeline_id, validate_depends_on,
 };
 use history::{RunHistoryStore, history_dir_from_state_arg};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use registry::{PipelineRegistry, register_and_spawn_pipeline};
 use watcher::{ReloadDebounce, spawn_config_watcher};
 use web::{AppState, start_server};
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    init_logging();
+
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .unwrap_or_else(|e| {
+            log::error!("Failed to install Prometheus recorder: {}", e);
+            std::process::exit(1);
+        });
 
     let args = parse_args();
     log::info!("Config: {}", args.config_path);
@@ -58,7 +66,12 @@ async fn main() {
         None
     };
 
-    let app_state = AppState::new(history.clone(), reload_debounce.clone(), registry.clone());
+    let app_state = AppState::new(
+        history.clone(),
+        reload_debounce.clone(),
+        registry.clone(),
+        prometheus_handle,
+    );
 
     let mut pipeline_count = 0usize;
     for item in loaded {
@@ -179,6 +192,32 @@ fn load_pipelines(args: &Args) -> Result<Vec<LoadedPipeline>, crate::error::EtlE
     };
     validate_depends_on(&loaded)?;
     Ok(loaded)
+}
+
+/// Plain text by default (today's behavior — readable for `cargo run`/
+/// local dev). Set `LOG_FORMAT=json` for one-JSON-object-per-line output
+/// (container/prod use, machine-parseable). Every `log::info!`/`warn!`/
+/// `error!` call site elsewhere in the codebase is unaffected — this only
+/// changes how a record is formatted into a line, not what gets logged.
+fn init_logging() {
+    let json = std::env::var("LOG_FORMAT")
+        .map(|v| v == "json")
+        .unwrap_or(false);
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if json {
+        builder.format(|buf, record| {
+            use std::io::Write;
+            let entry = serde_json::json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "level": record.level().to_string(),
+                "target": record.target(),
+                "message": record.args().to_string(),
+            });
+            writeln!(buf, "{}", entry)
+        });
+    }
+    builder.init();
 }
 
 fn spawn_web_server(app_state: AppState, port: u16) {

@@ -104,21 +104,7 @@ fn parse_json_row(line: &str) -> Result<Row, EtlError> {
 }
 
 fn convert_json_value(json_val: JsonValue) -> Value {
-    match json_val {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(b) => Value::Bool(b),
-        JsonValue::String(s) => Value::Text(s),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
-            } else {
-                Value::Text(n.to_string())
-            }
-        }
-        other => Value::Text(other.to_string()),
-    }
+    crate::types::json_to_value(json_val)
 }
 
 #[async_trait]

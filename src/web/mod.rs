@@ -6,6 +6,7 @@ use crate::registry::PipelineRegistry;
 use crate::scheduler::PipelineCommand;
 use crate::state::LogBuffer;
 use crate::watcher::ReloadDebounce;
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -27,6 +28,12 @@ pub struct AppState {
     /// can re-check and tick immediately instead of waiting for its own
     /// next scheduled tick — see `scheduler::run_pipeline_worker`.
     pub success_tx: broadcast::Sender<String>,
+    /// Renders the process-wide Prometheus registry — see `GET /metrics`
+    /// (`handlers::metrics`). Metrics are recorded directly via the
+    /// `metrics` crate's macros at the point each pipeline tick's outcome
+    /// is decided (`scheduler::run_once`/`try_schedule_tick`), not through
+    /// `AppState`.
+    pub prometheus_handle: PrometheusHandle,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -76,6 +83,7 @@ impl AppState {
         history: RunHistoryStore,
         reload_debounce: ReloadDebounce,
         registry: Option<PipelineRegistry>,
+        prometheus_handle: PrometheusHandle,
     ) -> Self {
         let (success_tx, _) = broadcast::channel(64);
         Self {
@@ -89,6 +97,7 @@ impl AppState {
             reload_debounce,
             registry,
             success_tx,
+            prometheus_handle,
         }
     }
 
@@ -260,6 +269,7 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
 
     let app = Router::new()
         .route("/api/status", get(handlers::status))
+        .route("/metrics", get(handlers::metrics))
         .route("/api/pipelines", post(handlers::create_pipeline))
         .route("/api/pipelines/:id", delete(handlers::delete_pipeline))
         .route("/api/logs", get(handlers::logs))
