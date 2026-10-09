@@ -1,12 +1,18 @@
 use std::sync::{Arc, Mutex};
 
-use crate::config::{PipelineConfig, SourceConfig, TransformConfig, poll_interval_secs};
+use crate::config::{
+    DestinationConfig, PipelineConfig, SourceConfig, TransformConfig, poll_interval_secs,
+};
 use crate::error::EtlError;
 use crate::extractor::Extractor;
 use crate::extractor::clickhouse::ClickHouseExtractor;
 use crate::extractor::csv::CsvExtractor;
 use crate::extractor::postgres::PostgresExtractor;
+use crate::extractor::s3::S3Extractor;
+use crate::loader::Loader;
+use crate::loader::clickhouse::ClickHouseLoader;
 use crate::loader::postgres::PostgresLoader;
+use crate::loader::s3::S3Loader;
 use crate::pipeline::{Pipeline, PipelineState};
 use crate::scheduler::ScheduleMode;
 use crate::state::PersistentState;
@@ -53,7 +59,7 @@ pub async fn build_pipeline(
         build_extractor(config, &persistent_state, &state_path).await?;
     let transformers = build_transformers(config);
     let loader = build_loader(config).await?;
-    let pipeline = Pipeline::new(extractor, transformers, Box::new(loader));
+    let pipeline = Pipeline::new(extractor, transformers, loader);
 
     let (schedule, schedule_label) = resolve_schedule(config, interval_secs)?;
 
@@ -81,7 +87,7 @@ pub async fn rebuild_pipeline_parts(
         build_extractor(config, &persistent_state, state_path).await?;
     let transformers = build_transformers(config);
     let loader = build_loader(config).await?;
-    let pipeline = Pipeline::new(extractor, transformers, Box::new(loader));
+    let pipeline = Pipeline::new(extractor, transformers, loader);
     let (schedule, schedule_label) = resolve_schedule(config, interval_secs)?;
     Ok((pipeline, schedule, schedule_label))
 }
@@ -155,6 +161,31 @@ async fn build_extractor(
             )?;
             Ok((interval, Box::new(e)))
         }
+        SourceConfig::S3 {
+            bucket,
+            prefix,
+            format,
+            delimiter,
+            region,
+            endpoint_url,
+            ..
+        } => {
+            log::info!("Source: S3 bucket {} prefix {}", bucket, prefix);
+            let store = crate::s3_store::build_store(
+                bucket,
+                region.as_deref(),
+                endpoint_url.as_deref(),
+            )?;
+            let e = S3Extractor::new(
+                store,
+                prefix.clone(),
+                format.clone(),
+                *delimiter,
+                Arc::clone(persistent_state),
+                state_path.to_string(),
+            );
+            Ok((interval, Box::new(e)))
+        }
     }
 }
 
@@ -193,19 +224,55 @@ fn chunk_size_from(config: &PipelineConfig) -> usize {
     }
 }
 
-async fn build_loader(config: &PipelineConfig) -> Result<PostgresLoader, EtlError> {
-    if config.destination.dest_type != "postgres" {
-        return Err(EtlError::ConfigError(format!(
-            "Unsupported destination type '{}' (only 'postgres' is supported)",
-            config.destination.dest_type
-        )));
+async fn build_loader(config: &PipelineConfig) -> Result<Box<dyn Loader>, EtlError> {
+    match &config.destination {
+        DestinationConfig::Postgres {
+            connection_string,
+            table,
+            unique_key,
+        } => {
+            log::info!("Destination: PostgreSQL");
+            let l = PostgresLoader::connect(
+                connection_string,
+                table.clone(),
+                chunk_size_from(config),
+                unique_key.clone(),
+            )
+            .await?;
+            Ok(Box::new(l))
+        }
+        DestinationConfig::ClickHouse {
+            host,
+            database,
+            table,
+            username,
+            password,
+        } => {
+            log::info!("Destination: ClickHouse at {} database {}", host, database);
+            let l = ClickHouseLoader::new(
+                host.clone(),
+                database.clone(),
+                table.clone(),
+                username.clone(),
+                password.clone(),
+            )?;
+            Ok(Box::new(l))
+        }
+        DestinationConfig::S3 {
+            bucket,
+            prefix,
+            format,
+            region,
+            endpoint_url,
+        } => {
+            log::info!("Destination: S3 bucket {} prefix {}", bucket, prefix);
+            let store = crate::s3_store::build_store(
+                bucket,
+                region.as_deref(),
+                endpoint_url.as_deref(),
+            )?;
+            let l = S3Loader::new(store, prefix.clone(), format.clone());
+            Ok(Box::new(l))
+        }
     }
-    log::info!("Connecting to destination DB...");
-    PostgresLoader::connect(
-        &config.destination.connection_string,
-        config.destination.table.clone(),
-        chunk_size_from(config),
-        config.destination.unique_key.clone(),
-    )
-    .await
 }

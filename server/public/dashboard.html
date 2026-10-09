@@ -197,6 +197,13 @@
                         </div>
                     </div>
 
+                    <div>
+                        <label class="block text-xs text-gray-500 mb-1">Alert webhook URL (optional)</label>
+                        <input type="text" x-model="form.alertWebhook" placeholder="https://hooks.slack.com/services/..."
+                               class="w-full bg-gray-950 border border-gray-800 rounded px-2 py-1.5 text-sm mono">
+                        <p class="text-[11px] text-gray-600 mt-0.5">Notified on Error/Blocked (once per transition) and again on recovery — Slack incoming-webhook compatible.</p>
+                    </div>
+
                     <!-- Dependencies -->
                     <div>
                         <div class="flex justify-between items-center mb-1.5">
@@ -232,6 +239,7 @@
                             <option value="postgres">PostgreSQL</option>
                             <option value="csv">CSV</option>
                             <option value="clickhouse">ClickHouse</option>
+                            <option value="s3">S3</option>
                         </select>
                     </div>
                     <div class="space-y-2">
@@ -320,9 +328,17 @@
 
                 <!-- Destination -->
                 <div>
-                    <label class="text-xs font-semibold text-gray-300 mb-2 block">Destination (PostgreSQL)</label>
+                    <div class="flex justify-between items-center mb-2">
+                        <label class="text-xs font-semibold text-gray-300">Destination</label>
+                        <select x-model="form.destination.type" @change="onDestinationTypeChange()"
+                                class="bg-gray-950 border border-gray-800 rounded px-2 py-1 text-xs">
+                            <option value="postgres">PostgreSQL</option>
+                            <option value="clickhouse">ClickHouse</option>
+                            <option value="s3">S3</option>
+                        </select>
+                    </div>
                     <div class="space-y-2">
-                        <template x-for="f in DESTINATION_FIELDS.postgres" :key="f.key">
+                        <template x-for="f in DESTINATION_FIELDS[form.destination.type]" :key="f.key">
                             <div>
                                 <label class="block text-xs text-gray-500 mb-1" x-text="f.label + (f.required ? ' *' : '')"></label>
                                 <input type="text" x-model="form.destination[f.key]" :placeholder="f.placeholder"
@@ -526,6 +542,15 @@
                 { key: 'chunk_size', label: 'Chunk size (optional)', type: 'number', placeholder: '10000', required: false },
                 { key: 'poll_interval_secs', label: 'Poll interval, seconds (optional)', type: 'number', placeholder: '30', required: false, help: 'Only used if no cron schedule is set above.' },
             ],
+            s3: [
+                { key: 'bucket', label: 'Bucket', type: 'text', placeholder: 'my-bucket', required: true },
+                { key: 'prefix', label: 'Prefix', type: 'text', placeholder: 'incoming', required: true },
+                { key: 'format', label: 'Format (optional)', type: 'text', placeholder: 'jsonl', required: false, help: '"jsonl" or "csv". Defaults to jsonl.' },
+                { key: 'delimiter', label: 'CSV delimiter (optional)', type: 'text', placeholder: ',', required: false },
+                { key: 'region', label: 'Region (optional)', type: 'text', placeholder: 'us-east-1', required: false },
+                { key: 'endpoint_url', label: 'Endpoint URL (optional)', type: 'text', placeholder: 'http://localhost:9199', required: false, help: 'For S3-compatible stores (MinIO, etc). Leave blank for real AWS.' },
+                { key: 'poll_interval_secs', label: 'Poll interval, seconds (optional)', type: 'number', placeholder: '30', required: false, help: 'Only used if no cron schedule is set above.' },
+            ],
         };
 
         const DESTINATION_FIELDS = {
@@ -533,6 +558,20 @@
                 { key: 'connection_string', label: 'Connection string', type: 'text', placeholder: 'postgresql://user:pass@host:5432/db', required: true },
                 { key: 'table', label: 'Table', type: 'text', placeholder: 'my_table', required: true },
                 { key: 'unique_key', label: 'Unique key column (optional)', type: 'text', placeholder: 'id', required: false },
+            ],
+            clickhouse: [
+                { key: 'host', label: 'Host', type: 'text', placeholder: 'http://localhost:8123', required: true },
+                { key: 'database', label: 'Database', type: 'text', placeholder: 'default', required: true },
+                { key: 'table', label: 'Table', type: 'text', placeholder: 'my_table', required: true },
+                { key: 'username', label: 'Username (optional)', type: 'text', placeholder: 'default', required: false },
+                { key: 'password', label: 'Password (optional)', type: 'password', placeholder: '', required: false },
+            ],
+            s3: [
+                { key: 'bucket', label: 'Bucket', type: 'text', placeholder: 'my-bucket', required: true },
+                { key: 'prefix', label: 'Prefix', type: 'text', placeholder: 'exports', required: true },
+                { key: 'format', label: 'Format (optional)', type: 'text', placeholder: 'jsonl', required: false, help: '"jsonl" or "csv". Defaults to jsonl.' },
+                { key: 'region', label: 'Region (optional)', type: 'text', placeholder: 'us-east-1', required: false },
+                { key: 'endpoint_url', label: 'Endpoint URL (optional)', type: 'text', placeholder: 'http://localhost:9199', required: false, help: 'For S3-compatible stores (MinIO, etc). Leave blank for real AWS.' },
             ],
         };
 
@@ -750,6 +789,7 @@
                         id: '',
                         schedule: '*/30 * * * * *',
                         cronPreset: '*/30 * * * * *',
+                        alertWebhook: '',
                         dependsOn: [],
                         source: { type: 'postgres' },
                         transforms: [],
@@ -766,6 +806,7 @@
                     f.schedule = obj.schedule || '';
                     const preset = CRON_PRESETS.find(p => p.value === f.schedule);
                     f.cronPreset = preset ? preset.value : 'custom';
+                    f.alertWebhook = obj.alert_webhook || '';
 
                     f.dependsOn = (obj.depends_on || []).map(d => {
                         if (typeof d === 'string') return { id: d, maxStaleness: '' };
@@ -804,6 +845,7 @@
                     const cfg = {};
                     if (this.form.id) cfg.id = this.form.id;
                     if (this.form.schedule) cfg.schedule = this.form.schedule;
+                    if (this.form.alertWebhook) cfg.alert_webhook = this.form.alertWebhook;
 
                     const deps = this.form.dependsOn.filter(d => d.id);
                     if (deps.length) {
@@ -863,6 +905,10 @@
 
                 onSourceTypeChange() {
                     this.ensureFields(this.form.source, SOURCE_FIELDS[this.form.source.type] || []);
+                },
+
+                onDestinationTypeChange() {
+                    this.ensureFields(this.form.destination, DESTINATION_FIELDS[this.form.destination.type] || []);
                 },
 
                 addDependency() {

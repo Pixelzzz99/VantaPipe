@@ -29,7 +29,109 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 | **Error visibility** | Every error carries an `error_kind` (`connection`/`query`/`config`/`load`/`transform`) shown in the dashboard, not just a message string |
 | **Auth** | Optional HTTP Basic Auth (`ETL_AUTH_USER`/`ETL_AUTH_PASS`) gating the whole dashboard + API |
 | **Observability** | Prometheus `/metrics`, `LOG_FORMAT=json` structured logs, dashboard with per-pipeline status and live logs |
+| **Alerting** | Optional per-pipeline `alert_webhook` — fires on Error/Blocked (once per transition) and on recovery; Slack-compatible JSON body |
 | **Ops** | Docker image + `docker-compose` for local Postgres + engine |
+
+---
+
+## How this compares
+
+Short answer: dataflow-rs isn't trying to be a smaller Airflow. It targets
+a narrower problem — small-to-mid scale "extract, reshape, load" pipelines
+— and trades Airflow's breadth for operational simplicity. Worth being
+precise about where that trade actually helps, and where it doesn't.
+
+### Where the operational model differs
+
+Airflow needs a metadata database (Postgres/MySQL — not optional, it's the
+source of truth for DAG state, task instances, and XComs), a scheduler, a
+webserver/API server, workers, and for `CeleryExecutor` a message broker —
+5-7 moving parts with their own failure modes before a single task runs.
+[Prefect's own comparison](https://prefect.io/blog/airflow-local-development)
+puts local Airflow setup at "4+ services, 8GB RAM, and days of
+configuration." Dagster and Prefect improved the authoring experience
+(software-defined assets, decorator-based flows) but didn't remove this —
+both are still Python, both still need a long-running daemon/scheduler
+process plus a database for self-hosted use (`dagster-daemon` + Postgres;
+Prefect Server + its own DB), with the convenient managed path behind a
+paid cloud tier in both cases.
+
+dataflow-rs's engine is a single Rust process with no metadata database —
+pipeline state is flat JSONL/JSON files, not Postgres. There's no
+scheduler/webserver/worker split to keep in sync. The dashboard is served
+by a small Node.js gateway in front of it (see [Architecture](#architecture))
+— that's two processes total, not a cluster.
+
+### Where the authoring model differs
+
+Airflow DAGs are Python files, and XCom is how data passes between tasks —
+but XCom was built for small values (state, file paths, IDs), not bulk
+rows: it's stored in the metadata DB, JSON-serialized by default, with
+size ceilings that follow the DB engine (roughly 1 GiB on Postgres in
+Airflow 2, tighter in Airflow 3; far smaller on MySQL). Airflow is built to
+*orchestrate calls* to external systems, not move row data in-process
+between steps.
+
+dataflow-rs pipelines are JSON config, not code, and rows flow directly
+between the built-in `filter`/`map`/`aggregate` steps in-process — there's
+no metadata-DB bottleneck because the row data never touches one. When
+declarative transforms aren't enough, a `custom` transform step runs a
+real JS function (embedded QuickJS, no external Node/Python process) with
+a wall-clock timeout — "I need actual code" doesn't mean "now write a
+whole DAG file."
+
+### Where dependency triggering differs
+
+Airflow/Dagster/Prefect orchestrate task-to-task; dataflow-rs's
+`depends_on` is pipeline-to-pipeline, and intentionally simpler — one
+pipeline waits for another's last run to have succeeded (optionally within
+a freshness window), and the moment it does, the dependent ticks
+immediately via an in-process broadcast rather than waiting on its own
+next poll. There's no cross-pipeline data passing, no DAG graph UI, no
+backfill/catch-up — it's a dependency gate, not a workflow engine.
+
+### What we give up
+
+This half matters more, and it's worth stating plainly rather than
+burying it:
+
+- **Connector ecosystem.** Airflow has 100+ official provider packages and
+  1,500+ operators/hooks/sensors. dataflow-rs has four sources (Postgres,
+  ClickHouse, CSV, S3) and three destinations (Postgres, ClickHouse, S3).
+  Need Salesforce, Kafka, GCS? That's a custom JS transform or a new Rust
+  extractor, not a package install.
+- **Scale and track record.** Airflow has a decade of production use at
+  Airbnb/Lyft/Netflix/Adobe scale. dataflow-rs is new, built over one
+  extended development effort, with no production deployments, no
+  community, and no battle-testing under real load. "Simpler" is not the
+  same claim as "proven" — don't read this section as the latter.
+- **Horizontal scale.** No Celery/Kubernetes-executor equivalent — one
+  engine process runs every pipeline's ticks as Tokio tasks on one
+  machine. Fine for dozens of lightweight pipelines; not a fit for
+  thousands of heavy ones across a cluster.
+- **Visibility.** The dashboard shows pipeline status, a run timeline, and
+  a Gantt view — not a DAG graph, not data lineage, not a Dagster-style
+  asset catalog.
+- **Dynamic task generation, backfill, cross-task data passing** — none of
+  these exist. `depends_on` is a gate, not an orchestrator.
+
+### The honest positioning
+
+dataflow-rs sits closer to single-binary, declarative-config tools like
+[Benthos/Bento](https://github.com/Jeffail/benthos) (Go, one binary, YAML
+config, no custom code required for the common case) or
+[Vector](https://vector.dev) (Rust, one binary, no runtime dependency)
+than to Airflow/Dagster/Prefect's "full orchestration platform" category.
+Worth noting: Prefect
+[announced it's acquiring Dagster Labs](https://dagster.io/blog/prefect-is-acquiring-dagster)
+in mid-2026 — both pledge to stay independent OSS projects, but it signals
+the "post-Airflow" generation consolidating around two players, not
+expanding. If the goal is a pipeline that's easy to stand up, has no
+Python/JVM runtime requirement on the engine itself, and doesn't need a
+Postgres instance just to track its own scheduling state — that's the
+niche this project fills. For hundreds of integrations, distributed
+execution, or a decade of production hardening, Airflow (or Dagster/
+Prefect) is still the right choice.
 
 ---
 
@@ -349,6 +451,85 @@ Drop `.csv` files into `watch_dir`. After a successful load, files are tracked i
 
 Use `{last_run}` in the query template; it is replaced with the last run timestamp.
 
+### ClickHouse destination
+
+```json
+{
+  "destination": {
+    "type": "clickhouse",
+    "host": "http://localhost:8123",
+    "database": "default",
+    "table": "orders_summary",
+    "username": "default",
+    "password": ""
+  }
+}
+```
+
+Inserted via ClickHouse's HTTP interface (`INSERT ... FORMAT JSONEachRow`)
+— same transport/auth style as the ClickHouse source above. `username`/
+`password` are optional (omit both for an unauthenticated instance). No
+`unique_key`/upsert concept here — ClickHouse's `MergeTree` engines handle
+deduplication their own way (e.g. `ReplacingMergeTree`) if you need it;
+every `load()` call is a plain insert.
+
+### S3 source
+
+```json
+{
+  "source": {
+    "type": "s3",
+    "bucket": "my-bucket",
+    "prefix": "incoming",
+    "format": "jsonl",
+    "delimiter": ",",
+    "region": "us-east-1",
+    "endpoint_url": null,
+    "poll_interval_secs": 30
+  },
+  "transforms": [],
+  "destination": {
+    "type": "postgres",
+    "connection_string": "postgresql://postgres:password@localhost:5432/dest_db",
+    "table": "imported_data",
+    "unique_key": null
+  }
+}
+```
+
+Polls for new objects under `prefix` (`format` is `"jsonl"` or `"csv"`,
+`delimiter` only applies to CSV). Each new object key is tracked in state
+the same way CSV source filenames are — already-processed keys are
+skipped on the next poll, no local disk involved.
+
+`endpoint_url` points at an S3-compatible store (MinIO, R2, or the
+`s3mock`/`minio` service in `docker-compose.yml`) instead of real AWS;
+leave it `null` for AWS itself. **Credentials are never part of the
+config** — they come from the standard AWS environment variables
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`) at process
+start, since pipeline configs flow through the dashboard/API and
+embedding secrets there would be a credential-leak risk.
+
+### S3 destination
+
+```json
+{
+  "destination": {
+    "type": "s3",
+    "bucket": "my-bucket",
+    "prefix": "exports",
+    "format": "jsonl",
+    "region": "us-east-1",
+    "endpoint_url": null
+  }
+}
+```
+
+Each `load()` call writes one new object to
+`{prefix}/{unix millis}.{jsonl|csv}` — never overwrites, so concurrent or
+successive loads can't collide. Same credential policy as the S3 source
+above (env vars only, never in the config).
+
 ### Transform types
 
 | Type | Fields | Description |
@@ -404,16 +585,23 @@ function transform(rows) {
 ## Docker
 
 ```bash
-# Postgres + ClickHouse only (default profile — for local dev against the
-# engine run via `cargo run`, or for exploring the seed data)
+# Postgres + ClickHouse + s3mock only (default profile — for local dev
+# against the engine run via `cargo run`, or for exploring the seed data)
 docker compose up --build
 
-# Full stack: Postgres + ClickHouse + engine (internal-only) + gateway
+# Full stack: Postgres + ClickHouse + s3mock + engine (internal-only) + gateway
 docker compose --profile app up --build
 ```
 
 - Postgres: `localhost:5434` (`etl` / `etlpassword` / `etldb`)
 - ClickHouse: `localhost:8123` (HTTP), see `docker/clickhouse-init/`
+- s3mock (S3-compatible, for the S3 source/destination without real AWS
+  credentials): `localhost:9199`, pre-seeded with an `etl-demo` bucket by
+  the `s3mock-init` one-shot container. Point `endpoint_url` at
+  `http://localhost:9199` (from the host) or `http://s3mock:9090` (from
+  another container on the compose network), and set
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` to any non-empty value —
+  s3mock doesn't validate them, `object_store` just requires them to be set.
 - Gateway (public, dashboard + auth): `localhost:3000`
 - Engine: **no published port** — only the `server` (gateway) container can
   reach it, over the compose network at `http://etl-engine:3000`
@@ -501,6 +689,40 @@ in behavior, every log call site is unaffected.
 ```bash
 LOG_FORMAT=json RUST_LOG=info cargo run -- config/pipeline.json etl_state.json 4000
 ```
+
+### Alerting
+
+Optional per-pipeline webhook — set `alert_webhook` in the pipeline config
+(or fill it in on the dashboard's Visual tab):
+
+```json
+{
+  "id": "orders",
+  "alert_webhook": "https://hooks.slack.com/services/T000/B000/XXXX",
+  "schedule": "*/30 * * * * *",
+  ...
+}
+```
+
+- Fires once when the pipeline **transitions** into `Error` or `Blocked`
+  (not on every repeated failing/blocked tick — a pipeline stuck failing
+  every 30s sends one alert, not one every 30s) — and again, once, when it
+  **recovers**.
+- The JSON body always includes a `"text"` field, which is all a Slack
+  incoming webhook needs, plus structured fields (`pipeline`, `status`,
+  `error_kind`/`reason`) for any other webhook consumer (Discord-via-
+  adapter, a custom catcher, n8n/Zapier, etc.):
+  ```json
+  { "text": "🔴 [orders] error (connection): ...", "pipeline": "orders", "status": "error", "error_kind": "connection", "message": "..." }
+  { "text": "🟣 [orders] blocked: waiting on 'upstream'...", "pipeline": "orders", "status": "blocked", "reason": "..." }
+  { "text": "✅ [orders] recovered", "pipeline": "orders", "status": "recovered" }
+  ```
+- Fire-and-forget — a failed webhook delivery is logged and dropped, never
+  retried and never slows down a tick. This is a notification channel, not
+  a guaranteed-delivery system.
+- Hot-reloadable like `schedule`/`depends_on` — editing `alert_webhook` and
+  saving (via the API or the file on disk) takes effect on the pipeline's
+  next tick, no restart needed.
 
 ---
 

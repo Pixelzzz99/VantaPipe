@@ -1,3 +1,4 @@
+mod alert;
 mod config;
 mod error;
 mod extractor;
@@ -7,6 +8,7 @@ mod pipeline;
 mod registry;
 mod retry;
 mod runtime;
+mod s3_store;
 mod scheduler;
 mod state;
 mod transformer;

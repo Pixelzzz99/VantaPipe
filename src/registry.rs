@@ -105,6 +105,7 @@ pub async fn register_and_spawn_pipeline(
         pipeline: Arc::new(RwLock::new(Arc::new(built.pipeline))),
         schedule: Arc::new(RwLock::new(built.schedule)),
         depends_on: Arc::new(RwLock::new(config.depends_on.unwrap_or_default())),
+        alert_webhook: Arc::new(RwLock::new(config.alert_webhook)),
         pipeline_state: built.pipeline_state,
         persistent_state: built.persistent_state,
         app_state: app_state.clone(),
