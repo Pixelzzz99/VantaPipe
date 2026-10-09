@@ -6,6 +6,7 @@ mod history;
 mod loader;
 mod pipeline;
 mod registry;
+mod replay;
 mod retry;
 mod runtime;
 mod s3_store;

@@ -64,37 +64,7 @@ impl CsvExtractor {
     }
 
     fn read_csv_file(&self, path: &Path) -> Result<Vec<Row>, EtlError> {
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(self.delimiter)
-            .has_headers(true)
-            .from_path(path)
-            .map_err(|e| {
-                EtlError::QueryError(format!("Cannot open CSV file: {}: {}", path.display(), e))
-            })?;
-
-        let headers: Vec<String> = reader
-            .headers()
-            .map_err(|e| EtlError::QueryError(e.to_string()))?
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let mut rows = Vec::new();
-
-        for result in reader.records() {
-            let record =
-                result.map_err(|e| EtlError::QueryError(format!("CSV parse error: {}", e)))?;
-
-            let row: Row = headers
-                .iter()
-                .zip(record.iter())
-                .map(|(header, value)| (header.clone(), parse_csv_value(value)))
-                .collect();
-
-            rows.push(row);
-        }
-
-        Ok(rows)
+        read_csv_file(path, self.delimiter)
     }
 
     fn move_to_processed(&self, file_path: &Path) -> Result<(), EtlError> {
@@ -111,6 +81,60 @@ impl CsvExtractor {
         })?;
         Ok(())
     }
+}
+
+fn read_csv_file(path: &Path, delimiter: u8) -> Result<Vec<Row>, EtlError> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(true)
+        .from_path(path)
+        .map_err(|e| {
+            EtlError::QueryError(format!("Cannot open CSV file: {}: {}", path.display(), e))
+        })?;
+
+    let headers: Vec<String> = reader
+        .headers()
+        .map_err(|e| EtlError::QueryError(e.to_string()))?
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut rows = Vec::new();
+
+    for result in reader.records() {
+        let record =
+            result.map_err(|e| EtlError::QueryError(format!("CSV parse error: {}", e)))?;
+
+        let row: Row = headers
+            .iter()
+            .zip(record.iter())
+            .map(|(header, value)| (header.clone(), parse_csv_value(value)))
+            .collect();
+
+        rows.push(row);
+    }
+
+    Ok(rows)
+}
+
+/// Re-read specific already-processed files directly from `processed_dir`
+/// (where `move_to_processed` archives them) — used by the replay path
+/// (`src/replay.rs`). Deliberately bypasses `CsvExtractor`/`find_new_csv_files`
+/// entirely: no dedup check, no file move, no `PersistentState` touched, so
+/// it can't race the live worker.
+pub fn read_processed_files(
+    processed_dir: &str,
+    filenames: &[String],
+    delimiter: char,
+) -> Result<Vec<Row>, EtlError> {
+    let dir = Path::new(processed_dir);
+    let mut all_rows = Vec::new();
+    for filename in filenames {
+        let path = dir.join(filename);
+        let rows = read_csv_file(&path, delimiter as u8)?;
+        all_rows.extend(rows);
+    }
+    Ok(all_rows)
 }
 
 fn parse_csv_value(s: &str) -> Value {
@@ -136,7 +160,11 @@ fn parse_csv_value(s: &str) -> Value {
 
 #[async_trait]
 impl Extractor for CsvExtractor {
-    async fn extract(&self, _last_run: DateTime<Utc>) -> Result<Vec<Row>, EtlError> {
+    async fn extract(
+        &self,
+        _last_run: DateTime<Utc>,
+        _until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Row>, EtlError> {
         let files = self.find_new_csv_files()?;
         if files.is_empty() {
             log::info!("No new CSV files in {:?}", self.watch_dir);
@@ -231,5 +259,29 @@ mod tests {
         );
 
         std::fs::remove_file(tmp).ok();
+    }
+
+    #[test]
+    fn test_read_processed_files() {
+        let dir = std::env::temp_dir()
+            .join(format!("etl_csv_replay_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("orders-1.csv"),
+            "id,amount\n1,100.0\n2,200.5\n",
+        )
+        .unwrap();
+
+        let rows = read_processed_files(
+            dir.to_str().unwrap(),
+            &["orders-1.csv".to_string()],
+            ',',
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("id"), Some(&Value::Int(1)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

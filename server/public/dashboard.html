@@ -446,7 +446,8 @@
 
                 <!-- hover tooltip -->
                 <div x-show="hoveredBar" x-cloak
-                     class="absolute z-10 -translate-x-1/2 -translate-y-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg shadow-xl text-xs mono pointer-events-none"
+                     class="absolute z-10 -translate-x-1/2 -translate-y-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg shadow-xl text-xs mono"
+                     @mouseenter="hoveredBar = hoveredBar" @mouseleave="hoveredBar = null"
                      :style="hoveredBar ? ('left:' + hoveredBar.left + '%; top:' + hoveredBar.top + 'px') : ''">
                     <template x-if="hoveredBar">
                         <div class="space-y-0.5 whitespace-nowrap">
@@ -454,11 +455,17 @@
                             <div :class="historyMeta(hoveredBar.status).text" x-text="hoveredBar.status + ' · ' + hoveredBar.rows + ' rows'"></div>
                             <div class="text-gray-500" x-text="formatTime(hoveredBar.started_at) + ' → ' + formatTime(hoveredBar.finished_at)"></div>
                             <div class="text-gray-500" x-text="'duration: ' + hoveredBar.durationLabel"></div>
+                            <button class="mt-1 w-full text-left text-amber-400 hover:text-amber-300"
+                                    @click="replayWindow(hoveredBar)" x-text="replaying ? 'Replaying…' : 'Replay this window'"
+                                    :disabled="replaying"></button>
                         </div>
                     </template>
                 </div>
             </div>
         </div>
+        <div class="mt-2 px-2.5 py-1.5 rounded text-xs" x-show="replayMsg.text"
+             :class="replayMsg.ok ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-red-500/10 text-red-400 border border-red-500/20'"
+             x-text="replayMsg.text"></div>
     </div>
 
     <!-- Logs -->
@@ -594,6 +601,8 @@
                 ganttTicks: [],
                 ganttRangeHours: 1,
                 hoveredBar: null,
+                replaying: false,
+                replayMsg: { ok: true, text: '' },
                 deletingId: null,
                 wsConnected: false,
                 ws: null,
@@ -647,6 +656,31 @@
                 async ctrl(id, action) {
                     await fetch(`/api/pipelines/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
                     await this.fetchStatus();
+                },
+
+                async replayWindow(bar) {
+                    if (this.replaying) return;
+                    this.replaying = true;
+                    this.replayMsg = { ok: true, text: '' };
+                    try {
+                        const res = await fetch(`/api/pipelines/${encodeURIComponent(bar.pipeline_id)}/replay`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ from: bar.started_at, until: bar.finished_at }),
+                        });
+                        const data = await res.json();
+                        if (res.ok) {
+                            this.replayMsg = { ok: true, text: `Replayed ${bar.pipeline_id}: ${data.rows_loaded} row(s) loaded` };
+                            await Promise.all([this.fetchStatus(), this.fetchHistory()]);
+                        } else {
+                            this.replayMsg = { ok: false, text: data.error || 'Replay failed' };
+                        }
+                    } catch (e) {
+                        this.replayMsg = { ok: false, text: String(e.message || e) };
+                    } finally {
+                        this.replaying = false;
+                        this.hoveredBar = null;
+                    }
                 },
 
                 confirmDelete(id) {

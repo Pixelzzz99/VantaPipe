@@ -315,6 +315,7 @@ async fn run_once(
                 rows: 0,
                 error: None,
                 error_kind: None,
+                trigger: None,
             });
             if was_unhealthy {
                 if let Some(url) = &alert_webhook {
@@ -346,6 +347,7 @@ async fn run_once(
                 rows: count,
                 error: None,
                 error_kind: None,
+                trigger: None,
             });
             // Wake up any dependents waiting on this pipeline (see
             // `WorkerContext.dep_rx`) instead of making them poll on
@@ -390,6 +392,7 @@ async fn run_once(
                 rows: 0,
                 error: Some(e.to_string()),
                 error_kind: Some(e.kind().to_string()),
+                trigger: None,
             });
         }
     }
@@ -559,6 +562,7 @@ mod tests {
             rows: 0,
             error: None,
             error_kind: None,
+            trigger: None,
         }
     }
 
@@ -654,6 +658,7 @@ mod tests {
         async fn extract(
             &self,
             _last_run: chrono::DateTime<Utc>,
+            _until: Option<chrono::DateTime<Utc>>,
         ) -> Result<Vec<crate::types::Row>, crate::error::EtlError> {
             Ok(vec![])
         }
@@ -770,6 +775,7 @@ mod tests {
         async fn extract(
             &self,
             _last_run: chrono::DateTime<Utc>,
+            _until: Option<chrono::DateTime<Utc>>,
         ) -> Result<Vec<crate::types::Row>, crate::error::EtlError> {
             if self.fail.load(Ordering::SeqCst) {
                 Err(crate::error::EtlError::QueryError("boom".to_string()))

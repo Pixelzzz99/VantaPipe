@@ -59,6 +59,20 @@ impl S3Extractor {
             .collect())
     }
 
+    /// Re-GET specific keys directly, bypassing `find_new_keys`/dedup
+    /// entirely — no `is_file_processed` check, no `mark_file_processed`,
+    /// no `.save()`. Used by the replay path (`src/replay.rs`); safe to run
+    /// alongside the live worker since nothing here mutates shared state
+    /// and S3 objects aren't moved/deleted on read.
+    pub async fn read_keys(&self, keys: &[String]) -> Result<Vec<Row>, EtlError> {
+        let mut all_rows = Vec::new();
+        for key in keys {
+            let rows = self.read_object(key).await?;
+            all_rows.extend(rows);
+        }
+        Ok(all_rows)
+    }
+
     async fn read_object(&self, key: &str) -> Result<Vec<Row>, EtlError> {
         let result = self
             .store
@@ -138,7 +152,11 @@ fn parse_jsonl_bytes(bytes: &[u8], key: &str) -> Result<Vec<Row>, EtlError> {
 
 #[async_trait]
 impl Extractor for S3Extractor {
-    async fn extract(&self, _last_run: DateTime<Utc>) -> Result<Vec<Row>, EtlError> {
+    async fn extract(
+        &self,
+        _last_run: DateTime<Utc>,
+        _until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Row>, EtlError> {
         let keys = self.find_new_keys().await?;
         if keys.is_empty() {
             log::info!("No new objects under s3://{}", self.prefix);
@@ -207,12 +225,12 @@ mod tests {
             state_path.clone(),
         );
 
-        let rows = extractor.extract(Utc::now()).await.unwrap();
+        let rows = extractor.extract(Utc::now(), None).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get("id"), Some(&Value::Int(1)));
 
         // Second poll: same object, nothing new.
-        let rows2 = extractor.extract(Utc::now()).await.unwrap();
+        let rows2 = extractor.extract(Utc::now(), None).await.unwrap();
         assert!(rows2.is_empty(), "expected the already-processed object to be skipped");
 
         let _ = std::fs::remove_file(&state_path);
@@ -239,9 +257,44 @@ mod tests {
             state_path.clone(),
         );
 
-        let rows = extractor.extract(Utc::now()).await.unwrap();
+        let rows = extractor.extract(Utc::now(), None).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".to_string())));
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[tokio::test]
+    async fn test_read_keys_bypasses_dedup_state() {
+        let store = InMemory::new();
+        put_jsonl(&store, "incoming/orders-1.jsonl", &[r#"{"id": 1}"#]).await;
+
+        let state_path = temp_state_path("replay");
+        let state = Arc::new(Mutex::new(PersistentState::new()));
+        {
+            let mut s = state.lock().unwrap();
+            s.mark_file_processed("incoming/orders-1.jsonl");
+        }
+        let extractor = S3Extractor::new(
+            Arc::new(store),
+            "incoming".to_string(),
+            "jsonl".to_string(),
+            ',',
+            Arc::clone(&state),
+            state_path.clone(),
+        );
+
+        // Already marked processed above — a normal extract() would skip
+        // it, but read_keys() must re-read it regardless.
+        let rows = extractor
+            .read_keys(&["incoming/orders-1.jsonl".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("id"), Some(&Value::Int(1)));
+
+        // Dedup state untouched by read_keys — still exactly what we set above.
+        assert!(state.lock().unwrap().is_file_processed("incoming/orders-1.jsonl"));
 
         let _ = std::fs::remove_file(&state_path);
     }

@@ -112,8 +112,11 @@ burying it:
 - **Visibility.** The dashboard shows pipeline status, a run timeline, and
   a Gantt view — not a DAG graph, not data lineage, not a Dagster-style
   asset catalog.
-- **Dynamic task generation, backfill, cross-task data passing** — none of
-  these exist. `depends_on` is a gate, not an orchestrator.
+- **Dynamic task generation, cross-task data passing** — neither exists.
+  `depends_on` is a gate, not an orchestrator. Backfill exists (see
+  [Replay](#replay-backfill)) but it's one explicit request per
+  range/file-list — no scheduled/bulk backfill ("replay the last 30 days")
+  and no backfill of a pipeline's *dependents* when it replays.
 
 ### The honest positioning
 
@@ -723,6 +726,70 @@ Optional per-pipeline webhook — set `alert_webhook` in the pipeline config
 - Hot-reloadable like `schedule`/`depends_on` — editing `alert_webhook` and
   saving (via the API or the file on disk) takes effect on the pipeline's
   next tick, no restart needed.
+
+---
+
+## Replay (backfill)
+
+Re-run a pipeline over already-processed data — "rerun yesterday" or
+"reprocess this one file again" — without disturbing the live pipeline's
+normal incremental cursor/dedup state. `POST /api/pipelines/:id/replay`
+builds a standalone, throwaway pipeline from the config file for one
+explicit request, runs it, and tears it down; the live scheduled pipeline
+and its state are never touched.
+
+This is a distinct endpoint from `POST /api/pipelines/:id/run` — `/run`
+forces an ordinary extra tick against the *live* shared pipeline/state
+(same as a normal scheduled tick, just off-schedule); `/replay` is a
+separate, isolated run with an explicit range or file/key list.
+
+The request shape depends on the pipeline's source type:
+
+- **Postgres/ClickHouse** (cursor-based) — `{"from": "...", "until": "..."}`,
+  an RFC3339 time range:
+  ```bash
+  curl -X POST http://localhost:3000/api/pipelines/orders/replay \
+    -H 'Content-Type: application/json' \
+    -d '{"from": "2026-10-08T00:00:00Z", "until": "2026-10-09T00:00:00Z"}'
+  ```
+  By default a query only has a lower-bound placeholder (`$1`/`{last_run}`)
+  and has no upper bound — fine for normal ticks, but a replay needs both
+  ends pinned. To make a query replay-bounded, add a second placeholder:
+  Postgres `$2`, ClickHouse `{until}`. A query without the second
+  placeholder still works for both normal ticks and `/replay` — it's just
+  unbounded on the high end (everything after `from`, same as a normal
+  tick). When the second placeholder *is* present but no `until` is given
+  (an ordinary scheduled tick against a query template someone wrote to
+  also support replay), it defaults to "now" — one query template safely
+  serves both normal ticks and replay.
+  ```json
+  { "query": "SELECT ... FROM orders WHERE updated_at > $1 AND updated_at <= $2" }
+  ```
+- **CSV/S3** (dedup-based — time is irrelevant, a file/key either has or
+  hasn't been processed) — `{"keys": [...]}`, specific already-ingested
+  filenames (CSV, read from `processed_dir`) or object keys (S3), bypassing
+  the dedup check entirely:
+  ```bash
+  curl -X POST http://localhost:3000/api/pipelines/s3-import/replay \
+    -H 'Content-Type: application/json' \
+    -d '{"keys": ["incoming/orders-2026-10-08.jsonl"]}'
+  ```
+
+Sending the wrong shape for a pipeline's source type (e.g. `keys` against
+a Postgres source) is a `400` with an explanatory error, not a silent
+no-op.
+
+**Idempotency caveat**: a Postgres destination only dedups a replay against
+the original load if `unique_key` is set (`ON CONFLICT (key) DO NOTHING`)
+— without it, replaying re-inserts the rows a second time. ClickHouse/S3
+destinations have no upsert concept at all; replaying into them always
+produces new rows/objects (same as a normal tick). This isn't a bug — it's
+the same idempotency model every other tick already has, replay doesn't
+change it.
+
+From the dashboard: hover a bar in the Gantt chart and click "Replay this
+window" — pre-fills `from`/`until` from that run's start/end. Picking
+specific CSV/S3 keys to replay is API-only for now (no dashboard picker).
 
 ---
 

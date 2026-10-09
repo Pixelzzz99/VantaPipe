@@ -278,6 +278,7 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         .route("/api/pipelines/:id/resume", post(handlers::resume))
         .route("/api/pipelines/:id/stop", post(handlers::stop))
         .route("/api/pipelines/:id/run", post(handlers::run_once))
+        .route("/api/pipelines/:id/replay", post(handlers::replay))
         .route(
             "/api/pipelines/:id/config",
             get(handlers::get_config).put(handlers::put_config),

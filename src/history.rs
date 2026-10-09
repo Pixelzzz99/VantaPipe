@@ -24,6 +24,11 @@ pub struct RunRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub error_kind: Option<String>,
+    /// `Some("replay")` for a run started via `POST .../replay` (see
+    /// `src/replay.rs`), `None`/absent for an ordinary scheduled or
+    /// manually-triggered tick.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 #[derive(Clone)]
@@ -151,6 +156,7 @@ mod tests {
                 rows: i,
                 error: None,
                 error_kind: None,
+                trigger: None,
             });
         }
 
@@ -172,6 +178,33 @@ mod tests {
         let line = r#"{"pipeline_id":"p1","started_at":"2024-01-01T00:00:00Z","finished_at":null,"status":"success","rows":0,"error":null}"#;
         let rec: RunRecord = serde_json::from_str(line).expect("legacy record should deserialize");
         assert_eq!(rec.error_kind, None);
+        assert_eq!(rec.trigger, None);
+    }
+
+    #[test]
+    fn test_trigger_survives_jsonl_round_trip() {
+        let dir = std::env::temp_dir().join(format!("etl_hist_trigger_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RunHistoryStore::new(dir.clone());
+
+        store.record_finished(RunRecord {
+            pipeline_id: "p1".into(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            status: RunOutcome::Success,
+            rows: 3,
+            error: None,
+            error_kind: None,
+            trigger: Some("replay".into()),
+        });
+
+        let store2 = RunHistoryStore::new(dir.clone());
+        store2.load_pipeline("p1");
+        let recs = store2.for_pipeline("p1");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].trigger.as_deref(), Some("replay"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -188,6 +221,7 @@ mod tests {
             rows: 0,
             error: Some("boom".into()),
             error_kind: Some("connection".into()),
+            trigger: None,
         });
 
         let store2 = RunHistoryStore::new(dir.clone());

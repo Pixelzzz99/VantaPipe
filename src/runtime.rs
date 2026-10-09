@@ -110,7 +110,7 @@ fn resolve_schedule(
     }
 }
 
-async fn build_extractor(
+pub(crate) async fn build_extractor(
     config: &PipelineConfig,
     persistent_state: &Arc<Mutex<PersistentState>>,
     state_path: &str,
@@ -189,7 +189,7 @@ async fn build_extractor(
     }
 }
 
-fn build_transformers(config: &PipelineConfig) -> Vec<Box<dyn Transformer>> {
+pub(crate) fn build_transformers(config: &PipelineConfig) -> Vec<Box<dyn Transformer>> {
     config
         .transforms
         .iter()
@@ -224,7 +224,7 @@ fn chunk_size_from(config: &PipelineConfig) -> usize {
     }
 }
 
-async fn build_loader(config: &PipelineConfig) -> Result<Box<dyn Loader>, EtlError> {
+pub(crate) async fn build_loader(config: &PipelineConfig) -> Result<Box<dyn Loader>, EtlError> {
     match &config.destination {
         DestinationConfig::Postgres {
             connection_string,
