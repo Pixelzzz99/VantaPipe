@@ -11,6 +11,59 @@ pub enum Value {
 
 pub type Row = HashMap<String, Value>;
 
+/// `Value` -> `serde_json::Value`. Used to hand rows to anything that
+/// speaks JSON — currently the custom JS transform boundary
+/// (`transformer::custom_js`).
+pub fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Int(i) => serde_json::Value::from(*i),
+        Value::Float(f) => serde_json::Value::from(*f),
+        Value::Text(s) => serde_json::Value::from(s.clone()),
+        Value::Bool(b) => serde_json::Value::from(*b),
+        Value::Null => serde_json::Value::Null,
+    }
+}
+
+/// `serde_json::Value` -> `Value`. Shared by the ClickHouse extractor
+/// (`extractor::clickhouse`) and the custom JS transform boundary
+/// (`transformer::custom_js`) — both need to turn arbitrary JSON back into
+/// our row representation the same way.
+pub fn json_to_value(json_val: serde_json::Value) -> Value {
+    match json_val {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::String(s) => Value::Text(s),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Text(n.to_string())
+            }
+        }
+        other => Value::Text(other.to_string()),
+    }
+}
+
+pub fn row_to_json(row: &Row) -> serde_json::Value {
+    serde_json::Value::Object(
+        row.iter()
+            .map(|(k, v)| (k.clone(), value_to_json(v)))
+            .collect(),
+    )
+}
+
+pub fn json_to_row(json_val: serde_json::Value) -> Row {
+    match json_val {
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| (k, json_to_value(v)))
+            .collect(),
+        _ => Row::new(),
+    }
+}
+
 /*
  * Помощная функция для создания строки (Row) из вектора пар (ключ, значение).
  * Как работает:

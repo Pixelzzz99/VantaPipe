@@ -11,9 +11,10 @@ use crate::pipeline::{Pipeline, PipelineState};
 use crate::scheduler::ScheduleMode;
 use crate::state::PersistentState;
 use crate::transformer::{
-    Transformer, aggregator::AggregateTransformer, filter::FilterTransformer,
-    mapper::MapTransformer,
+    Transformer, aggregator::AggregateTransformer, custom_js::CustomJsTransformer,
+    filter::FilterTransformer, mapper::MapTransformer,
 };
+use std::time::Duration;
 
 /// Fully constructed pipeline ready for the scheduler.
 pub struct BuiltPipeline {
@@ -170,6 +171,15 @@ fn build_transformers(config: &PipelineConfig) -> Vec<Box<dyn Transformer>> {
                 TransformConfig::Aggregate { group_by, sum } => {
                     Box::new(AggregateTransformer::new(group_by.clone(), sum.clone()))
                 }
+                TransformConfig::Custom {
+                    script,
+                    function,
+                    timeout_ms,
+                } => Box::new(CustomJsTransformer::new(
+                    script.clone(),
+                    function.clone(),
+                    Duration::from_millis(*timeout_ms),
+                )),
             }
         })
         .collect()

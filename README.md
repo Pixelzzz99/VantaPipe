@@ -26,9 +26,9 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 | **History** | Run timeline + simple Gantt (last hour); JSONL under `{state}/history/` |
 | **Incremental** | Tracks `last_run` / processed files so restarts don't re-load everything |
 | **Reliability** | Exponential backoff retries on pipeline failures |
-| **Error visibility** | Every error carries an `error_kind` (`connection`/`query`/`config`/`load`) shown in the dashboard, not just a message string |
+| **Error visibility** | Every error carries an `error_kind` (`connection`/`query`/`config`/`load`/`transform`) shown in the dashboard, not just a message string |
 | **Auth** | Optional HTTP Basic Auth (`ETL_AUTH_USER`/`ETL_AUTH_PASS`) gating the whole dashboard + API |
-| **Observability** | `RUST_LOG` logging + Web UI with per-pipeline status and live logs |
+| **Observability** | Prometheus `/metrics`, `LOG_FORMAT=json` structured logs, dashboard with per-pipeline status and live logs |
 | **Ops** | Docker image + `docker-compose` for local Postgres + engine |
 
 ---
@@ -356,6 +356,48 @@ Use `{last_run}` in the query template; it is replaced with the last run timesta
 | `filter` | `column`, `value` | Keep rows where the column equals `value` (text match) |
 | `map` | `rename` | Rename columns (`old_name` → `new_name`) |
 | `aggregate` | `group_by`, `sum` | Group by one column and sum a numeric column |
+| `custom` | `script`, `function`, `timeout_ms` | Run a user-authored JS function over the row batch — see below |
+
+### Custom JS transform
+
+When `filter`/`map`/`aggregate` can't express the reshaping you need, drop
+to real code:
+
+```json
+{
+  "type": "custom",
+  "script": "scripts/my_transform.js",
+  "function": "transform",
+  "timeout_ms": 5000
+}
+```
+
+```js
+// scripts/my_transform.js
+function transform(rows) {
+    return rows
+        .filter(r => r.status === 'active')
+        .map(r => ({ ...r, total_amount: r.amount * 1.1 }));
+}
+```
+
+- `script` (required) — path to a `.js` file, resolved the same way as
+  every other path in a config (relative to the working directory, or
+  absolute).
+- `function` (optional, default `"transform"`) — which top-level function
+  in the script to call with the row array.
+- `timeout_ms` (optional, default `5000`) — execution is interrupted if it
+  runs longer than this; that's the *only* sandboxing (no filesystem/
+  network restriction) — this engine assumes a trusted operator, not
+  untrusted multi-tenant code.
+- Runs in-process via an embedded QuickJS engine (`rquickjs`) — no system
+  Node/JS runtime needed.
+- The script is **re-read from disk on every tick**, not cached — edit it
+  and the very next run picks up the change, no reload/restart required.
+- Rows cross the boundary as plain JSON (`JSON.parse`/`JSON.stringify`),
+  so the function is ordinary, dependency-free JS.
+- A thrown error, a missing function, or a timeout all fail the tick with
+  `error_kind: "transform"`, same as any other pipeline error.
 
 ---
 
@@ -425,6 +467,39 @@ cd server && ETL_ENGINE_URL=http://localhost:4000 npm start
 │   └── Dockerfile
 ├── docker-compose.yml
 └── Dockerfile               # builds the Rust engine image
+```
+
+---
+
+## Observability
+
+### Metrics
+
+`GET /metrics` on the engine's internal API (not proxied through the
+gateway — same network-isolation story as the rest of `/api/*`; point
+Prometheus at `http://etl-engine:3000/metrics` from a container on the
+same compose network, or `http://localhost:<port>` locally):
+
+| Metric | Type | Labels |
+|---|---|---|
+| `etl_pipeline_runs_total` | counter | `pipeline`, `outcome` (`success`/`empty`/`error`) |
+| `etl_pipeline_rows_total` | counter | `pipeline` |
+| `etl_pipeline_errors_total` | counter | `pipeline`, `kind` (same categories as `error_kind` in the dashboard) |
+| `etl_pipeline_duration_seconds` | histogram | `pipeline` |
+| `etl_pipeline_blocked_total` | counter | `pipeline` — incremented each time a scheduled tick is skipped because a `depends_on` entry hasn't succeeded |
+
+Deliberately no live gauges (pipeline count, currently-running count) —
+`GET /api/status` already answers those; metrics here are for the
+over-time questions status polling can't answer.
+
+### Structured logs
+
+Plain text by default. Set `LOG_FORMAT=json` for one-JSON-object-per-line
+output (`{"timestamp", "level", "target", "message"}`) — no other change
+in behavior, every log call site is unaffected.
+
+```bash
+LOG_FORMAT=json RUST_LOG=info cargo run -- config/pipeline.json etl_state.json 4000
 ```
 
 ---

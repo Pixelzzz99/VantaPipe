@@ -6,6 +6,7 @@ pub enum EtlError {
     QueryError(String),
     ConfigError(String),
     LoadError(String),
+    TransformError(String),
 }
 
 impl fmt::Display for EtlError {
@@ -15,6 +16,7 @@ impl fmt::Display for EtlError {
             EtlError::QueryError(msg) => write!(f, "Query error: {}", msg),
             EtlError::ConfigError(msg) => write!(f, "Config error: {}", msg),
             EtlError::LoadError(msg) => write!(f, "Load error: {}", msg),
+            EtlError::TransformError(msg) => write!(f, "Transform error: {}", msg),
         }
     }
 }
@@ -26,6 +28,7 @@ impl EtlError {
             EtlError::QueryError(_) => "query",
             EtlError::ConfigError(_) => "config",
             EtlError::LoadError(_) => "load",
+            EtlError::TransformError(_) => "transform",
         }
     }
 }
@@ -62,6 +65,7 @@ mod tests {
             EtlError::QueryError('q'.to_string()),
             EtlError::ConfigError('g'.to_string()),
             EtlError::LoadError('l'.to_string()),
+            EtlError::TransformError('t'.to_string()),
         ];
 
         for err in errors {
@@ -75,5 +79,6 @@ mod tests {
         assert_eq!(EtlError::QueryError("x".to_string()).kind(), "query");
         assert_eq!(EtlError::ConfigError("x".to_string()).kind(), "config");
         assert_eq!(EtlError::LoadError("x".to_string()).kind(), "load");
+        assert_eq!(EtlError::TransformError("x".to_string()).kind(), "transform");
     }
 }

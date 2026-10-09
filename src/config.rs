@@ -107,6 +107,24 @@ pub enum TransformConfig {
     Filter { column: String, value: String },
     Map { rename: HashMap<String, String> },
     Aggregate { group_by: String, sum: String },
+    /// Runs a user-authored JS function (loaded fresh from `script` on
+    /// every tick — edits take effect on the next run, no reload needed)
+    /// over the whole row batch. See `transformer::custom_js`.
+    Custom {
+        script: String,
+        #[serde(default = "default_custom_function")]
+        function: String,
+        #[serde(default = "default_custom_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+fn default_custom_function() -> String {
+    "transform".to_string()
+}
+
+fn default_custom_timeout_ms() -> u64 {
+    5000
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +417,59 @@ mod tests {
                 assert_eq!(*poll_interval_secs, 60);
             }
             _ => panic!("Expected ClickHouse source"),
+        }
+    }
+
+    #[test]
+    fn test_custom_transform_parses_with_defaults() {
+        let dir = tempfile_dir("custom_transform_defaults");
+        write_fixture(
+            &dir,
+            "p.json",
+            r#"{
+              "source": { "type": "csv", "watch_dir": "w", "processed_dir": "p", "poll_interval_secs": 5 },
+              "transforms": [ { "type": "custom", "script": "scripts/t.js" } ],
+              "destination": { "type": "postgres", "connection_string": "postgres://x", "table": "t" }
+            }"#,
+        );
+        let config = load_config(dir.join("p.json").to_str().unwrap()).expect("should parse");
+        match &config.transforms[0] {
+            TransformConfig::Custom {
+                script,
+                function,
+                timeout_ms,
+            } => {
+                assert_eq!(script, "scripts/t.js");
+                assert_eq!(function, "transform");
+                assert_eq!(*timeout_ms, 5000);
+            }
+            other => panic!("expected Custom transform, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_custom_transform_parses_with_explicit_fields() {
+        let dir = tempfile_dir("custom_transform_explicit");
+        write_fixture(
+            &dir,
+            "p.json",
+            r#"{
+              "source": { "type": "csv", "watch_dir": "w", "processed_dir": "p", "poll_interval_secs": 5 },
+              "transforms": [ { "type": "custom", "script": "scripts/t.js", "function": "reshape", "timeout_ms": 1000 } ],
+              "destination": { "type": "postgres", "connection_string": "postgres://x", "table": "t" }
+            }"#,
+        );
+        let config = load_config(dir.join("p.json").to_str().unwrap()).expect("should parse");
+        match &config.transforms[0] {
+            TransformConfig::Custom {
+                function,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(function, "reshape");
+                assert_eq!(*timeout_ms, 1000);
+            }
+            other => panic!("expected Custom transform, got {:?}", other),
         }
     }
 

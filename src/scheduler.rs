@@ -180,6 +180,8 @@ async fn try_schedule_tick(
             if let Err(reason) = dependencies_satisfied(&ctx.id, &depends_on, &ctx.history) {
                 ctx.app_state
                     .set_pipeline_status(&ctx.id, PipelineStatus::Blocked(reason));
+                metrics::counter!("etl_pipeline_blocked_total", "pipeline" => ctx.id.clone())
+                    .increment(1);
                 return;
             }
         }
@@ -256,6 +258,8 @@ async fn run_once(
     let op_name = format!("pipeline:{}", id);
     let result = retry_with_backoff(3, 2, &op_name, || pipeline.run(pipeline_state)).await;
     let finished_at = Utc::now();
+    let duration_secs =
+        finished_at.signed_duration_since(started_at).num_milliseconds() as f64 / 1000.0;
 
     let restore_status = |app: &AppState| {
         match mode {
@@ -265,12 +269,17 @@ async fn run_once(
         }
     };
 
+    metrics::histogram!("etl_pipeline_duration_seconds", "pipeline" => id.to_string())
+        .record(duration_secs);
+
     match result {
         Ok(0) => {
             restore_status(app_state);
             let msg = format!("[{}] [INFO] No new data", id);
             app_state.log(msg.clone());
             log::info!("{}", msg);
+            metrics::counter!("etl_pipeline_runs_total", "pipeline" => id.to_string(), "outcome" => "empty")
+                .increment(1);
             history.record_finished(RunRecord {
                 pipeline_id: id.to_string(),
                 started_at,
@@ -286,6 +295,10 @@ async fn run_once(
             app_state.add_pipeline_rows(id, count);
             restore_status(app_state);
             app_state.log(format!("[{}] [INFO] Processed {} rows", id, count));
+            metrics::counter!("etl_pipeline_runs_total", "pipeline" => id.to_string(), "outcome" => "success")
+                .increment(1);
+            metrics::counter!("etl_pipeline_rows_total", "pipeline" => id.to_string())
+                .increment(count);
 
             {
                 let mut s = persistent_state.lock().unwrap();
@@ -310,6 +323,10 @@ async fn run_once(
         Err(e) => {
             log::error!("[{}] Pipeline error: {}", id, e);
             app_state.add_pipeline_error(id);
+            metrics::counter!("etl_pipeline_runs_total", "pipeline" => id.to_string(), "outcome" => "error")
+                .increment(1);
+            metrics::counter!("etl_pipeline_errors_total", "pipeline" => id.to_string(), "kind" => e.kind())
+                .increment(1);
             if mode == ControlMode::Active {
                 app_state.set_pipeline_error(id, e.to_string(), e.kind());
             } else {
@@ -435,6 +452,15 @@ fn save_state(persistent_state: &Arc<Mutex<PersistentState>>, path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A local (non-globally-installed) recorder — `install_recorder()`
+    // sets a process-wide global and would conflict across tests running
+    // in the same process.
+    fn test_prometheus_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle()
+    }
 
     #[test]
     fn test_paused_blocks_non_force_ticks() {
@@ -594,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_schedule_tick_sets_blocked_status_when_dependency_unsatisfied() {
         let history = test_history_store("blocked_status");
-        let app_state = AppState::new(history.clone(), Default::default(), None);
+        let app_state = AppState::new(history.clone(), Default::default(), None, test_prometheus_handle());
         app_state.register_pipeline(
             "downstream".to_string(),
             "downstream.json".to_string(),
@@ -633,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn test_downstream_triggers_immediately_on_upstream_success() {
         let history = test_history_store("dag_trigger");
-        let app_state = AppState::new(history.clone(), Default::default(), None);
+        let app_state = AppState::new(history.clone(), Default::default(), None, test_prometheus_handle());
         app_state.register_pipeline(
             "downstream".to_string(),
             "downstream.json".to_string(),

@@ -32,3 +32,6 @@ axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 cron = "0.15"
 notify = "6"
+rquickjs = "0.6"
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
