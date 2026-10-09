@@ -44,6 +44,8 @@ pub struct WorkerContext {
     pub pipeline: Arc<RwLock<Arc<Pipeline>>>,
     pub schedule: Arc<RwLock<ScheduleMode>>,
     pub depends_on: Arc<RwLock<Vec<DependsOnEntry>>>,
+    /// Hot-reloadable, like `depends_on`/`schedule` — see `alert.rs`.
+    pub alert_webhook: Arc<RwLock<Option<String>>>,
     pub pipeline_state: Arc<Mutex<PipelineState>>,
     pub persistent_state: Arc<Mutex<PersistentState>>,
     pub app_state: AppState,
@@ -178,10 +180,22 @@ async fn try_schedule_tick(
         let depends_on = ctx.depends_on.read().unwrap().clone();
         if !depends_on.is_empty() {
             if let Err(reason) = dependencies_satisfied(&ctx.id, &depends_on, &ctx.history) {
+                let was_blocked = matches!(
+                    ctx.app_state.get_pipeline_status(&ctx.id),
+                    Some(PipelineStatus::Blocked(_))
+                );
                 ctx.app_state
-                    .set_pipeline_status(&ctx.id, PipelineStatus::Blocked(reason));
+                    .set_pipeline_status(&ctx.id, PipelineStatus::Blocked(reason.clone()));
                 metrics::counter!("etl_pipeline_blocked_total", "pipeline" => ctx.id.clone())
                     .increment(1);
+                if !was_blocked {
+                    if let Some(url) = ctx.alert_webhook.read().unwrap().clone() {
+                        crate::alert::send_async(
+                            &url,
+                            crate::alert::blocked_payload(&ctx.id, &reason),
+                        );
+                    }
+                }
                 return;
             }
         }
@@ -225,6 +239,7 @@ async fn execute_tick(ctx: &WorkerContext, running: &Arc<AtomicBool>, mode: Cont
     let state_path = ctx.state_path.clone();
     let app_state = ctx.app_state.clone();
     let history = ctx.history.clone();
+    let alert_webhook = ctx.alert_webhook.read().unwrap().clone();
     let running = Arc::clone(running);
 
     tokio::spawn(async move {
@@ -237,6 +252,7 @@ async fn execute_tick(ctx: &WorkerContext, running: &Arc<AtomicBool>, mode: Cont
             &app_state,
             &history,
             mode,
+            alert_webhook,
         )
         .await;
         running.store(false, Ordering::SeqCst);
@@ -252,7 +268,18 @@ async fn run_once(
     app_state: &AppState,
     history: &RunHistoryStore,
     mode: ControlMode,
+    alert_webhook: Option<String>,
 ) {
+    // Captured before `set_pipeline_status(Running)` below overwrites it —
+    // this is what makes the Error/Blocked/Recovered alerts below fire
+    // only on a *transition*, not on every repeated tick with the same
+    // outcome.
+    let previous_status = app_state.get_pipeline_status(id);
+    let was_unhealthy = matches!(
+        previous_status,
+        Some(PipelineStatus::Error(_)) | Some(PipelineStatus::Blocked(_))
+    );
+
     let started_at = Utc::now();
     app_state.set_pipeline_status(id, PipelineStatus::Running);
     let op_name = format!("pipeline:{}", id);
@@ -289,6 +316,11 @@ async fn run_once(
                 error: None,
                 error_kind: None,
             });
+            if was_unhealthy {
+                if let Some(url) = &alert_webhook {
+                    crate::alert::send_async(url, crate::alert::recovered_payload(id));
+                }
+            }
         }
         Ok(count) => {
             log::info!("[{}] Processed {} rows", id, count);
@@ -319,6 +351,11 @@ async fn run_once(
             // `WorkerContext.dep_rx`) instead of making them poll on
             // their own schedule.
             app_state.success_tx.send(id.to_string()).ok();
+            if was_unhealthy {
+                if let Some(url) = &alert_webhook {
+                    crate::alert::send_async(url, crate::alert::recovered_payload(id));
+                }
+            }
         }
         Err(e) => {
             log::error!("[{}] Pipeline error: {}", id, e);
@@ -327,6 +364,15 @@ async fn run_once(
                 .increment(1);
             metrics::counter!("etl_pipeline_errors_total", "pipeline" => id.to_string(), "kind" => e.kind())
                 .increment(1);
+            let was_already_error = matches!(previous_status, Some(PipelineStatus::Error(_)));
+            if !was_already_error {
+                if let Some(url) = &alert_webhook {
+                    crate::alert::send_async(
+                        url,
+                        crate::alert::error_payload(id, &e.to_string(), e.kind()),
+                    );
+                }
+            }
             if mode == ControlMode::Active {
                 app_state.set_pipeline_error(id, e.to_string(), e.kind());
             } else {
@@ -394,6 +440,10 @@ async fn reload_pipeline(ctx: &WorkerContext) {
             {
                 let mut d = ctx.depends_on.write().unwrap();
                 *d = config.depends_on.clone().unwrap_or_default();
+            }
+            {
+                let mut w = ctx.alert_webhook.write().unwrap();
+                *w = config.alert_webhook.clone();
             }
             ctx.app_state.update_pipeline_schedule(&ctx.id, label.clone());
             ctx.app_state.log(format!(
@@ -637,6 +687,7 @@ mod tests {
             pipeline: Arc::new(RwLock::new(Arc::new(pipeline))),
             schedule: Arc::new(RwLock::new(ScheduleMode::Interval(10))),
             depends_on: Arc::new(RwLock::new(vec![simple_dep("upstream")])),
+            alert_webhook: Arc::new(RwLock::new(None)),
             pipeline_state: Arc::new(Mutex::new(crate::pipeline::PipelineState::new())),
             persistent_state: Arc::new(Mutex::new(PersistentState::new())),
             app_state: app_state.clone(),
@@ -681,6 +732,7 @@ mod tests {
             // tick below comes from the broadcast, not the timer.
             schedule: Arc::new(RwLock::new(ScheduleMode::Interval(3600))),
             depends_on: Arc::new(RwLock::new(vec![simple_dep("upstream")])),
+            alert_webhook: Arc::new(RwLock::new(None)),
             pipeline_state: Arc::new(Mutex::new(crate::pipeline::PipelineState::new())),
             persistent_state: Arc::new(Mutex::new(PersistentState::new())),
             app_state: app_state.clone(),
@@ -708,5 +760,123 @@ mod tests {
             2,
             "expected a second tick triggered by the upstream success broadcast, not the 3600s timer"
         );
+    }
+
+    struct FlakyExtractor {
+        fail: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extractor::Extractor for FlakyExtractor {
+        async fn extract(
+            &self,
+            _last_run: chrono::DateTime<Utc>,
+        ) -> Result<Vec<crate::types::Row>, crate::error::EtlError> {
+            if self.fail.load(Ordering::SeqCst) {
+                Err(crate::error::EtlError::QueryError("boom".to_string()))
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alerts_fire_only_on_transition_and_on_recovery() {
+        // Minimal local HTTP server that records every JSON body POSTed
+        // to it — stands in for a Slack/generic webhook receiver.
+        let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_for_server = Arc::clone(&received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/alert",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let received = Arc::clone(&received_for_server);
+                    async move {
+                        received.lock().unwrap().push(body);
+                        axum::http::StatusCode::OK
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let webhook_url = format!("http://{}/alert", addr);
+
+        let history = test_history_store("alerts");
+        let app_state =
+            AppState::new(history.clone(), Default::default(), None, test_prometheus_handle());
+        app_state.register_pipeline(
+            "flaky".to_string(),
+            "flaky.json".to_string(),
+            "every 3600s".to_string(),
+            0,
+            0,
+        );
+
+        let fail = Arc::new(AtomicBool::new(true));
+        let pipeline = Pipeline::new(
+            Box::new(FlakyExtractor { fail: Arc::clone(&fail) }),
+            vec![],
+            Box::new(StubLoader),
+        );
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        app_state.register_control("flaky".to_string(), cmd_tx);
+
+        let ctx = WorkerContext {
+            id: "flaky".to_string(),
+            config_path: "flaky.json".to_string(),
+            state_path: std::env::temp_dir()
+                .join(format!("etl_alert_test_state_{}.json", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+            pipeline: Arc::new(RwLock::new(Arc::new(pipeline))),
+            schedule: Arc::new(RwLock::new(ScheduleMode::Interval(3600))),
+            depends_on: Arc::new(RwLock::new(vec![])),
+            alert_webhook: Arc::new(RwLock::new(Some(webhook_url))),
+            pipeline_state: Arc::new(Mutex::new(crate::pipeline::PipelineState::new())),
+            persistent_state: Arc::new(Mutex::new(PersistentState::new())),
+            app_state: app_state.clone(),
+            history: history.clone(),
+            cmd_rx,
+            dep_rx: app_state.subscribe_success(),
+        };
+
+        tokio::spawn(run_pipeline_worker(ctx));
+
+        // Each failing tick runs through run_once's real retry_with_backoff(3
+        // attempts, 2s base delay) before settling into Error — ~6s of
+        // actual backoff sleep, so these waits must clear that, not just
+        // cover scheduling overhead like the other tests in this file.
+        const RETRY_SETTLE: Duration = Duration::from_millis(7000);
+
+        // Initial forced startup tick fails -> exactly one "error" alert.
+        tokio::time::sleep(RETRY_SETTLE).await;
+        {
+            let got = received.lock().unwrap();
+            assert_eq!(got.len(), 1, "expected exactly one alert after first failure");
+            assert_eq!(got[0]["status"], "error");
+        }
+
+        // Still failing -> no duplicate alert.
+        app_state.send_command("flaky", PipelineCommand::Trigger).unwrap();
+        tokio::time::sleep(RETRY_SETTLE).await;
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "expected no duplicate alert while still failing"
+        );
+
+        // Fixed -> one "recovered" alert (succeeds on first attempt, no
+        // backoff wait needed here).
+        fail.store(false, Ordering::SeqCst);
+        app_state.send_command("flaky", PipelineCommand::Trigger).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        {
+            let got = received.lock().unwrap();
+            assert_eq!(got.len(), 2, "expected a recovered alert after the fix");
+            assert_eq!(got[1]["status"], "recovered");
+        }
     }
 }

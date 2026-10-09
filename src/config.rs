@@ -16,6 +16,12 @@ pub struct PipelineConfig {
     /// satisfies it, however old) or `{"id": ..., "max_staleness_secs": ...}` (the
     /// dependency's last success must also be no older than that many seconds).
     pub depends_on: Option<Vec<DependsOnEntry>>,
+    /// Optional webhook URL — a notification is POSTed when this pipeline
+    /// transitions into Error or Blocked (not on every repeated failing
+    /// tick), and again when it recovers. The JSON body always includes a
+    /// `"text"` field (Slack incoming-webhook compatible) plus structured
+    /// fields for any other consumer. See `alert.rs`.
+    pub alert_webhook: Option<String>,
     pub source: SourceConfig,
     pub transforms: Vec<TransformConfig>,
     pub destination: DestinationConfig,
@@ -84,6 +90,27 @@ pub enum SourceConfig {
         #[serde(default = "default_poll_interval_secs")]
         poll_interval_secs: u64,
     },
+    /// Lists objects under `prefix`, reads any not already marked
+    /// processed (same dedup mechanism as `Csv`, keyed by S3 object key),
+    /// parses each as `format`. Credentials come from standard AWS env
+    /// vars (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), never this
+    /// config — see `s3_store::build_store`.
+    S3 {
+        bucket: String,
+        prefix: String,
+        #[serde(default = "default_s3_format")]
+        format: String,
+        #[serde(default = "default_delimiter")]
+        delimiter: char,
+        region: Option<String>,
+        endpoint_url: Option<String>,
+        #[serde(default = "default_poll_interval_secs")]
+        poll_interval_secs: u64,
+    },
+}
+
+fn default_s3_format() -> String {
+    "jsonl".to_string()
 }
 
 fn default_delimiter() -> char {
@@ -128,12 +155,36 @@ fn default_custom_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DestinationConfig {
-    #[serde(rename = "type")]
-    pub dest_type: String,
-    pub connection_string: String,
-    pub table: String,
-    pub unique_key: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DestinationConfig {
+    Postgres {
+        connection_string: String,
+        table: String,
+        unique_key: Option<String>,
+    },
+    /// Inserted via ClickHouse's HTTP interface (`INSERT ... FORMAT
+    /// JSONEachRow`) — see `loader::clickhouse`.
+    #[serde(rename = "clickhouse")]
+    ClickHouse {
+        host: String,
+        database: String,
+        table: String,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        password: String,
+    },
+    /// Writes one new object per `load()` call to `{prefix}/{timestamp}.{ext}`
+    /// — see `loader::s3`. Credentials come from standard AWS env vars,
+    /// never this config.
+    S3 {
+        bucket: String,
+        prefix: String,
+        #[serde(default = "default_s3_format")]
+        format: String,
+        region: Option<String>,
+        endpoint_url: Option<String>,
+    },
 }
 
 /// A config loaded from disk with a resolved pipeline id.
@@ -339,6 +390,9 @@ pub fn poll_interval_secs(source: &SourceConfig) -> u64 {
         SourceConfig::ClickHouse {
             poll_interval_secs, ..
         } => *poll_interval_secs,
+        SourceConfig::S3 {
+            poll_interval_secs, ..
+        } => *poll_interval_secs,
     }
 }
 
@@ -377,7 +431,10 @@ mod tests {
         }
 
         assert_eq!(config.transforms.len(), 3);
-        assert_eq!(config.destination.table, "orders_summary");
+        match &config.destination {
+            DestinationConfig::Postgres { table, .. } => assert_eq!(table, "orders_summary"),
+            other => panic!("Expected Postgres destination, got {:?}", other),
+        }
         assert_eq!(config.depends_on, None);
     }
 
@@ -397,7 +454,10 @@ mod tests {
             _ => panic!("Expected CSV source"),
         }
 
-        assert_eq!(config.destination.unique_key, None);
+        match &config.destination {
+            DestinationConfig::Postgres { unique_key, .. } => assert_eq!(*unique_key, None),
+            other => panic!("Expected Postgres destination, got {:?}", other),
+        }
     }
 
     #[test]
@@ -444,6 +504,69 @@ mod tests {
                 assert_eq!(*timeout_ms, 5000);
             }
             other => panic!("expected Custom transform, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_s3_source_parses_with_defaults() {
+        let dir = tempfile_dir("s3_source_defaults");
+        write_fixture(
+            &dir,
+            "p.json",
+            r#"{
+              "source": { "type": "s3", "bucket": "my-bucket", "prefix": "incoming", "poll_interval_secs": 30 },
+              "transforms": [],
+              "destination": { "type": "postgres", "connection_string": "postgres://x", "table": "t" }
+            }"#,
+        );
+        let config = load_config(dir.join("p.json").to_str().unwrap()).expect("should parse");
+        match &config.source {
+            SourceConfig::S3 {
+                bucket,
+                prefix,
+                format,
+                region,
+                endpoint_url,
+                ..
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(prefix, "incoming");
+                assert_eq!(format, "jsonl");
+                assert_eq!(*region, None);
+                assert_eq!(*endpoint_url, None);
+            }
+            other => panic!("expected S3 source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_s3_destination_parses_with_explicit_fields() {
+        let dir = tempfile_dir("s3_destination_explicit");
+        write_fixture(
+            &dir,
+            "p.json",
+            r#"{
+              "source": { "type": "csv", "watch_dir": "w", "processed_dir": "p", "poll_interval_secs": 5 },
+              "transforms": [],
+              "destination": { "type": "s3", "bucket": "b", "prefix": "exports", "format": "csv", "region": "us-east-1", "endpoint_url": "http://localhost:9000" }
+            }"#,
+        );
+        let config = load_config(dir.join("p.json").to_str().unwrap()).expect("should parse");
+        match &config.destination {
+            DestinationConfig::S3 {
+                bucket,
+                prefix,
+                format,
+                region,
+                endpoint_url,
+            } => {
+                assert_eq!(bucket, "b");
+                assert_eq!(prefix, "exports");
+                assert_eq!(format, "csv");
+                assert_eq!(region.as_deref(), Some("us-east-1"));
+                assert_eq!(endpoint_url.as_deref(), Some("http://localhost:9000"));
+            }
+            other => panic!("expected S3 destination, got {:?}", other),
         }
     }
 
