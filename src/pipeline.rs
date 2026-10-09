@@ -47,9 +47,37 @@ impl Pipeline {
             s.last_run
         };
 
+        let loaded_count = self.execute(last_run, None).await?;
+
+        {
+            let mut s = state.lock().unwrap();
+            s.last_run = Utc::now();
+            s.rows_processed += loaded_count;
+        }
+
+        Ok(loaded_count)
+    }
+
+    /// Standalone extract→transform→load, bounded by an explicit `until`
+    /// instead of `PipelineState`. Used by the replay path (`src/replay.rs`)
+    /// against a throwaway `Pipeline` built fresh from a config — never
+    /// touches `PipelineState`, so it cannot corrupt a live cursor.
+    pub async fn run_once_bounded(
+        &self,
+        last_run: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<u64, EtlError> {
+        self.execute(last_run, until).await
+    }
+
+    async fn execute(
+        &self,
+        last_run: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<u64, EtlError> {
         // EXTRACT
         log::info!("Extracting data since {}", last_run);
-        let rows = self.extractor.extract(last_run).await?;
+        let rows = self.extractor.extract(last_run, until).await?;
         let extracted_count = rows.len() as u64;
         log::info!("Extractred {} rows", extracted_count);
 
@@ -71,14 +99,7 @@ impl Pipeline {
         self.loader.load(current_rows).await?;
         log::info!("Loaded {} rows ", loaded_count);
 
-        {
-            let mut s = state.lock().unwrap();
-            s.last_run = Utc::now();
-            s.rows_processed += loaded_count;
-        }
-
         Ok(loaded_count)
-
     }
 
 }
@@ -95,7 +116,11 @@ mod tests {
 
     #[async_trait]
     impl Extractor for MockExtractor {
-        async fn extract(&self, _last_run: DateTime<Utc>) -> Result<Vec<Row>, EtlError>{
+        async fn extract(
+            &self,
+            _last_run: DateTime<Utc>,
+            _until: Option<DateTime<Utc>>,
+        ) -> Result<Vec<Row>, EtlError>{
             Ok(self.rows.clone())
         }
     }

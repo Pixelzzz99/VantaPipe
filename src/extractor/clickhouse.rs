@@ -40,9 +40,15 @@ impl ClickHouseExtractor {
         })
     }
 
-    fn build_query(&self, last_run: DateTime<Utc>) -> String {
+    fn build_query(&self, last_run: DateTime<Utc>, until: Option<DateTime<Utc>>) -> String {
         let formatted = last_run.format("%Y-%m-%d %H:%M:%S").to_string();
-        self.query_template.replace("{last_run}", &formatted)
+        let query = self.query_template.replace("{last_run}", &formatted);
+        if query.contains("{until}") {
+            let until_formatted = until.unwrap_or_else(Utc::now).format("%Y-%m-%d %H:%M:%S").to_string();
+            query.replace("{until}", &until_formatted)
+        } else {
+            query
+        }
     }
 
     async fn execute_query(&self, sql: &str) -> Result<Vec<Row>, EtlError> {
@@ -109,8 +115,12 @@ fn convert_json_value(json_val: JsonValue) -> Value {
 
 #[async_trait]
 impl Extractor for ClickHouseExtractor {
-    async fn extract(&self, last_run: DateTime<Utc>) -> Result<Vec<Row>, EtlError> {
-        let sql = self.build_query(last_run);
+    async fn extract(
+        &self,
+        last_run: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Row>, EtlError> {
+        let sql = self.build_query(last_run, until);
         log::info!("ClickHouse query: {}", sql);
 
         let rows = self.execute_query(&sql).await?;
@@ -202,9 +212,50 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        let query = extractor.build_query(last_run);
+        let query = extractor.build_query(last_run, None);
         assert!(query.contains("2026-01-15 10:30:00"));
         assert!(!query.contains("{last_run}"));
+    }
+
+    #[test]
+    fn test_build_query_substitutes_explicit_until() {
+        let extractor = ClickHouseExtractor::new(
+            "http://localhost:8123".to_string(),
+            "default".to_string(),
+            "SELECT * FROM orders WHERE updated_at > '{last_run}' AND updated_at <= '{until}'"
+                .to_string(),
+            "default".to_string(),
+            "".to_string(),
+        )
+        .unwrap();
+        let last_run = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = chrono::DateTime::parse_from_rfc3339("2026-01-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let query = extractor.build_query(last_run, Some(until));
+        assert!(query.contains("2026-01-15 10:30:00"));
+        assert!(query.contains("2026-01-16 00:00:00"));
+        assert!(!query.contains("{until}"));
+    }
+
+    #[test]
+    fn test_build_query_defaults_until_to_now_when_absent() {
+        let extractor = ClickHouseExtractor::new(
+            "http://localhost:8123".to_string(),
+            "default".to_string(),
+            "SELECT * FROM orders WHERE updated_at > '{last_run}' AND updated_at <= '{until}'"
+                .to_string(),
+            "default".to_string(),
+            "".to_string(),
+        )
+        .unwrap();
+        let last_run = Utc::now();
+
+        let query = extractor.build_query(last_run, None);
+        assert!(!query.contains("{until}"), "query: {}", query);
     }
 
     #[test]

@@ -24,11 +24,23 @@ impl PostgresExtractor {
 
 #[async_trait]
 impl Extractor for PostgresExtractor {
-    async fn extract(&self, last_run: DateTime<Utc>) -> Result<Vec<Row>, EtlError> {
-        let sqlx_rows = sqlx::query(&self.query)
-            .bind(last_run)
-            .fetch_all(&self.pool)
-            .await?;
+    async fn extract(
+        &self,
+        last_run: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Row>, EtlError> {
+        let sqlx_rows = if wants_until(&self.query) {
+            sqlx::query(&self.query)
+                .bind(last_run)
+                .bind(until.unwrap_or_else(Utc::now))
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query(&self.query)
+                .bind(last_run)
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         let rows = sqlx_rows
             .iter()
@@ -38,6 +50,14 @@ impl Extractor for PostgresExtractor {
 
         Ok(rows)
     }
+}
+
+/// Whether this query template was authored with a second (`$2`) bound
+/// parameter — the convention a pipeline author opts into so the same
+/// query serves both normal ticks (`$2` defaults to `Utc::now()`) and a
+/// replay's explicit `until` bound.
+fn wants_until(query: &str) -> bool {
+    query.contains("$2")
 }
 
 fn convert_row(sqlx_row: &sqlx::postgres::PgRow) -> Row{
@@ -61,4 +81,15 @@ fn convert_row(sqlx_row: &sqlx::postgres::PgRow) -> Row{
         row.insert(col_name, value);
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_until;
+
+    #[test]
+    fn test_wants_until_detects_second_placeholder() {
+        assert!(wants_until("SELECT * FROM t WHERE updated_at > $1 AND updated_at <= $2"));
+        assert!(!wants_until("SELECT * FROM t WHERE updated_at > $1"));
+    }
 }

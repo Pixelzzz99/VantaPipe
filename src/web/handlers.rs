@@ -332,6 +332,49 @@ fn command_response(
     }
 }
 
+/// Distinct from `run_once` (`POST .../run`, which forces an ordinary
+/// extra tick against the *live* shared pipeline/state). This builds a
+/// standalone, throwaway pipeline from the config file and never touches
+/// the live `PipelineState`/`PersistentState`/scheduler — see `src/replay.rs`.
+pub async fn replay(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<crate::replay::ReplayRequest>,
+) -> impl IntoResponse {
+    let Some(config_path) = state.config_path(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pipeline not found"})),
+        )
+            .into_response();
+    };
+
+    match crate::replay::run_replay(&config_path, body).await {
+        Ok(summary) => {
+            state.history.record_finished(crate::history::RunRecord {
+                pipeline_id: id.clone(),
+                started_at: summary.started_at,
+                finished_at: Some(summary.finished_at),
+                status: if summary.rows_loaded > 0 {
+                    crate::history::RunOutcome::Success
+                } else {
+                    crate::history::RunOutcome::Empty
+                },
+                rows: summary.rows_loaded,
+                error: None,
+                error_kind: None,
+                trigger: Some("replay".to_string()),
+            });
+            (StatusCode::OK, Json(serde_json::json!(summary))).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::parse_cron_schedule;
