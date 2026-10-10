@@ -13,9 +13,9 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 
 | Area | What you get |
 |------|----------------|
-| **Sources** | PostgreSQL, ClickHouse, CSV file watching |
-| **Transforms** | Filter, column rename (map), group + sum aggregate |
-| **Destination** | PostgreSQL (batched inserts, optional upsert via `unique_key`) |
+| **Sources** | PostgreSQL, ClickHouse, CSV file watching, S3/object storage |
+| **Transforms** | Filter, column rename (map), group + sum aggregate, custom JS |
+| **Destinations** | PostgreSQL (batched inserts, optional upsert via `unique_key`), ClickHouse, S3/object storage |
 | **Multi-pipeline** | Load one JSON file or a directory of `*.json` configs |
 | **Dynamic registration** | Directory mode can start with **zero** pipelines and grow at runtime — via `POST /api/pipelines` or by dropping a new `*.json` file into the config directory — no restart |
 | **Dependencies** | `depends_on` — a pipeline only ticks once its dependencies last succeeded (optionally within a freshness window); a dependent triggers **immediately** on a dependency's success, not just on its own next tick; cycles and unknown ids are rejected at load *and* reload time |
@@ -24,6 +24,8 @@ Async **ETL** (Extract → Transform → Load): poll, transform, and load data w
 | **Controls** | Soft Pause / Resume / Stop + Run-once from the Web UI |
 | **Hot reload** | Edit JSON in the browser or on disk; pipeline rebuilds without process restart |
 | **History** | Run timeline + simple Gantt (last hour); JSONL under `{state}/history/` |
+| **Dependency graph** | Dashboard panel visualizing `depends_on` as a layered left-to-right graph, colored by live pipeline status |
+| **Replay** | Re-run a pipeline over a past time range or specific already-ingested files/keys, without disturbing its live cursor/dedup state |
 | **Incremental** | Tracks `last_run` / processed files so restarts don't re-load everything |
 | **Reliability** | Exponential backoff retries on pipeline failures |
 | **Error visibility** | Every error carries an `error_kind` (`connection`/`query`/`config`/`load`/`transform`) shown in the dashboard, not just a message string |
@@ -87,8 +89,10 @@ Airflow/Dagster/Prefect orchestrate task-to-task; dataflow-rs's
 pipeline waits for another's last run to have succeeded (optionally within
 a freshness window), and the moment it does, the dependent ticks
 immediately via an in-process broadcast rather than waiting on its own
-next poll. There's no cross-pipeline data passing, no DAG graph UI, no
-backfill/catch-up — it's a dependency gate, not a workflow engine.
+next poll. The dashboard visualizes the resulting `depends_on` graph (see
+below), but there's no cross-pipeline data passing and no automatic
+catch-up/backfill of dependents when an upstream pipeline is replayed —
+it's a dependency gate, not a workflow engine.
 
 ### What we give up
 
@@ -109,9 +113,9 @@ burying it:
   engine process runs every pipeline's ticks as Tokio tasks on one
   machine. Fine for dozens of lightweight pipelines; not a fit for
   thousands of heavy ones across a cluster.
-- **Visibility.** The dashboard shows pipeline status, a run timeline, and
-  a Gantt view — not a DAG graph, not data lineage, not a Dagster-style
-  asset catalog.
+- **Visibility.** The dashboard shows pipeline status, a run timeline, a
+  Gantt view, and a `depends_on` dependency graph — not data lineage
+  (which *rows* flowed where), not a Dagster-style asset catalog.
 - **Dynamic task generation, cross-task data passing** — neither exists.
   `depends_on` is a gate, not an orchestrator. Backfill exists (see
   [Replay](#replay-backfill)) but it's one explicit request per

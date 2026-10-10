@@ -33,6 +33,32 @@ services:
       timeout: 5s
       retries: 10
 
+  # S3-compatible object storage for local testing of the S3 source/
+  # destination connectors without real AWS credentials or a Docker Hub
+  # login (MinIO's own images now require one). s3mock accepts any
+  # access-key/secret pair, so the dummy values below only need to satisfy
+  # object_store's AmazonS3Builder::from_env(), which requires the env
+  # vars to be set but never validates them against s3mock.
+  s3mock:
+    image: adobe/s3mock:latest
+    ports:
+      - "9199:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the demo bucket used by docker/pipeline_s3*.json
+  # examples, then exits (s3mock doesn't auto-create buckets).
+  s3mock-init:
+    image: curlimages/curl:latest
+    depends_on:
+      s3mock:
+        condition: service_healthy
+    entrypoint: ["curl", "-s", "-X", "PUT", "http://s3mock:9090/etl-demo"]
+    restart: "no"
+
   # Interactive SQL shell against the clickhouse service. Not started by
   # `docker compose up` (needs a real terminal attached). Run it with:
   #   docker compose run --rm clickhouse-client
@@ -49,12 +75,18 @@ services:
   # Internal-only ETL engine. Not started by default (`docker compose up`
   # only brings up postgres + clickhouse) — run with `docker compose
   # --profile app up` once you've picked/edited a pipeline config. No
-  # `ports:` mapping on purpose: only the `server` gateway (over the
-  # compose network) can reach it, never the host directly.
+  # `ports:` mapping on purpose: only the dashboard (a separate repo/compose
+  # project now — see ../etl-engine-dashboard-ui) can reach it, over the
+  # shared `etl-net` external network below, never the host directly. Same
+  # story for Prometheus: point it at http://etl-engine:3000/metrics from a
+  # container on that network — it doesn't need a published port.
   etl-engine:
     profiles: ["app"]
     build: .
     image: etl-engine:latest
+    networks:
+      - default
+      - etl-net
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,25 +94,19 @@ services:
         condition: service_healthy
     environment:
       RUST_LOG: info
+      # LOG_FORMAT: json   # uncomment for structured (JSON) logs
     volumes:
       - ./docker:/app/config:ro
       - ./data:/app/data
     command: ["/app/config/pipeline.json", "/app/data/etl_state.json"]
     restart: unless-stopped
 
-  # Public-facing Node gateway: dashboard + Basic Auth + reverse proxy to
-  # `etl-engine`'s internal API (see server/README or the plan for design).
-  server:
-    profiles: ["app"]
-    build: ./server
-    image: dataflow-rs-gateway:latest
-    depends_on:
-      - etl-engine
-    environment:
-      PORT: 3000
-      ETL_ENGINE_URL: http://etl-engine:3000
-      # ETL_AUTH_USER: admin
-      # ETL_AUTH_PASS: change-me
-    ports:
-      - "3000:3000"
-    restart: unless-stopped
+networks:
+  default: {}
+  # Shared bridge the dashboard repo's compose project attaches to (as
+  # `external: true`) so it can reach `etl-engine` by container DNS name
+  # without the engine's port ever being published to the host. Owned here
+  # (created on first `docker compose --profile app up`); the dashboard
+  # repo only references it, never creates it — bring this stack up first.
+  etl-net:
+    name: etl-net
