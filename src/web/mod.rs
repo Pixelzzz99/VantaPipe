@@ -1,6 +1,7 @@
 pub mod handlers;
 pub mod ws;
 
+use crate::config::DependsOnEntry;
 use crate::history::RunHistoryStore;
 use crate::registry::PipelineRegistry;
 use crate::scheduler::PipelineCommand;
@@ -61,6 +62,10 @@ pub struct PipelineSnapshot {
     pub config_path: String,
     pub schedule: String,
     pub error_kind: Option<String>,
+    /// Same shape as the config file's `depends_on` (bare id string or
+    /// `{id, max_staleness_secs}`) — lets the dashboard draw the
+    /// dependency graph without a separate per-pipeline config fetch.
+    pub depends_on: Vec<DependsOnEntry>,
 }
 
 #[derive(Debug)]
@@ -130,6 +135,7 @@ impl AppState {
         schedule: String,
         total_rows: u64,
         total_errors: u64,
+        depends_on: Vec<DependsOnEntry>,
     ) {
         if let Ok(mut inner) = self.inner.write() {
             inner.pipelines.insert(
@@ -142,6 +148,7 @@ impl AppState {
                     config_path,
                     schedule,
                     error_kind: None,
+                    depends_on,
                 },
             );
         }
@@ -185,6 +192,14 @@ impl AppState {
         if let Ok(mut inner) = self.inner.write() {
             if let Some(p) = inner.pipelines.get_mut(id) {
                 p.schedule = schedule;
+            }
+        }
+    }
+
+    pub fn update_pipeline_depends_on(&self, id: &str, depends_on: Vec<DependsOnEntry>) {
+        if let Ok(mut inner) = self.inner.write() {
+            if let Some(p) = inner.pipelines.get_mut(id) {
+                p.depends_on = depends_on;
             }
         }
     }

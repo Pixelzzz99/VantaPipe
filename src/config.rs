@@ -1,6 +1,6 @@
 use crate::error::EtlError;
 use cron::Schedule;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -27,7 +27,7 @@ pub struct PipelineConfig {
     pub destination: DestinationConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum DependsOnEntry {
     Simple(String),

@@ -449,6 +449,8 @@ async fn reload_pipeline(ctx: &WorkerContext) {
                 *w = config.alert_webhook.clone();
             }
             ctx.app_state.update_pipeline_schedule(&ctx.id, label.clone());
+            ctx.app_state
+                .update_pipeline_depends_on(&ctx.id, config.depends_on.clone().unwrap_or_default());
             ctx.app_state.log(format!(
                 "[{}] [INFO] Reloaded config ({})",
                 ctx.id, label
@@ -682,6 +684,7 @@ mod tests {
             "every 10s".to_string(),
             0,
             0,
+            vec![],
         );
 
         let pipeline = Pipeline::new(Box::new(StubExtractor), vec![], Box::new(StubLoader));
@@ -722,6 +725,7 @@ mod tests {
             "every 3600s".to_string(),
             0,
             0,
+            vec![],
         );
 
         let pipeline = Pipeline::new(Box::new(StubExtractor), vec![], Box::new(StubLoader));
@@ -819,6 +823,7 @@ mod tests {
             "every 3600s".to_string(),
             0,
             0,
+            vec![],
         );
 
         let fail = Arc::new(AtomicBool::new(true));

@@ -88,6 +88,7 @@ pub async fn register_and_spawn_pipeline(
         built.schedule_label.clone(),
         rows.0,
         rows.1,
+        config.depends_on.clone().unwrap_or_default(),
     );
 
     log::info!(
